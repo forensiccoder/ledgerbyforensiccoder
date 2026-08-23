@@ -224,7 +224,7 @@ type PdfStatementBlock = {
 
 type BalanceTrend = { direction: Exclude<Direction, "Unknown">; amount: number };
 
-const PDF_DATE_AT_START = /^\s*((?:\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})|(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}))(?=\s|$)/;
+const PDF_DATE_AT_START = /^\s*((?:\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})|(?:\d{1,2}[\s\-]+[A-Za-z]{3,9}[\s,\-]+\d{2,4}))(?=\s|$)/;
 // A decimal component is deliberate: long reference numbers such as 1386030000001304 are
 // identifiers, not money. The guards also prevent the "01.10" part of a date matching.
 const PDF_MONEY = /(?<![\d/\.\-])(?:₹\s*)?(?:-|\()?\s*(?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2}\)?(?:\s*(?:CR|DR))?(?![\d\.])/gi;
@@ -310,7 +310,14 @@ function pdfTextToRows(text: string): unknown[][] {
     const date = parseIndianDate(dateMatch[1]);
     if (!date) return;
     active = { date, narrationParts: [], money: [] };
-    addLineToActiveBlock(clean(line.slice(dateMatch[0].length)));
+    let remainder = clean(line.slice(dateMatch[0].length));
+    // Utkarsh-style statements print Transaction Date and Value Date side by side. Keep the
+    // first (transaction) date, but do not let the identical value date become narration.
+    const valueDateMatch = remainder.match(PDF_DATE_AT_START);
+    if (valueDateMatch && parseIndianDate(valueDateMatch[1])?.iso === date.iso) {
+      remainder = clean(remainder.slice(valueDateMatch[0].length));
+    }
+    addLineToActiveBlock(remainder);
   });
   completeActiveBlock();
 
