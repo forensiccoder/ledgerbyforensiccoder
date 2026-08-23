@@ -209,49 +209,148 @@ function parseCsv(text: string) {
   return rows;
 }
 
-// Bank statement PDFs are laid out as: Date | Narration | (Ref) | Debit | Credit | Balance
-// (or sometimes just Date | Narration | Amount | Balance). The old heuristic assumed the
-// amount was always the second-to-last number on the line, which breaks the moment a bank
-// prints "0.00" in the inapplicable Debit/Credit cell instead of leaving it blank — the
-// same zero-fill problem that affected the CSV/XLSX path. Instead we keep every number we
-// find and let the shared rowsToTransactions pipeline (with its zero-aware nonZero() logic)
-// decide which one is the real amount, the same way it does for CSV/XLSX rows.
-function pdfTextToRows(text: string): unknown[][] {
-  const rows: unknown[][] = [["Date", "Narration", "Withdrawal", "Deposit", "Balance"]];
-  text.split(/\n+/).forEach((rawLine) => {
-    const line = rawLine.trim();
-    const dateMatch = line.match(/(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})/);
-    if (!dateMatch) return;
-    const dateAt = dateMatch.index ?? 0;
-    const before = line.slice(0, dateAt).trim();
-    const after = line.slice(dateAt + dateMatch[0].length);
-    const numberPattern = /-?(?:₹\s*)?\d[\d,]*(?:\.\d{1,2})?\s*(?:CR|DR)?/gi;
-    const matches = [...after.matchAll(numberPattern)].filter((match) => /\d/.test(match[0]));
-    if (!matches.length) return;
-    // Narration itself often contains numbers too (reference IDs, account digits, embedded
-    // dates), so we can't cut at the *first* number on the line — only at the start of the
-    // trailing cluster of amount columns, whatever the narration in front of it contains.
-    const columnCount = Math.min(matches.length, 3);
-    const amountsStart = matches[matches.length - columnCount].index ?? after.length;
-    const narration = `${before} ${after.slice(0, amountsStart)}`.trim();
-    if (!narration) return;
-    const numbers = matches.slice(-columnCount).map((match) => match[0].trim());
-    let withdrawal = "";
-    let deposit = "";
-    let balance = "";
-    if (numbers.length >= 3) {
-      // Standard 3-column layout: Debit, Credit, Balance (the last three numbers on the line).
-      [withdrawal, deposit, balance] = numbers;
-    } else if (numbers.length === 2) {
-      // Single Amount column + running Balance. Direction (Dr/Cr) is resolved later from any
-      // CR/DR suffix captured in the number itself, or from the narration text.
-      [withdrawal, balance] = numbers;
-      if (/cr\s*$/i.test(withdrawal)) { deposit = withdrawal; withdrawal = ""; }
-    } else {
-      [withdrawal] = numbers;
-    }
-    rows.push([dateMatch[0], narration, withdrawal, deposit, balance]);
+type PdfMoney = {
+  raw: string;
+  value: number;
+  start: number;
+  direction: Direction;
+};
+
+type PdfStatementBlock = {
+  date: { display: string; iso: string };
+  narrationParts: string[];
+  money: PdfMoney[];
+};
+
+type BalanceTrend = { direction: Exclude<Direction, "Unknown">; amount: number };
+
+const PDF_DATE_AT_START = /^\s*((?:\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})|(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}))(?=\s|$)/;
+// A decimal component is deliberate: long reference numbers such as 1386030000001304 are
+// identifiers, not money. The guards also prevent the "01.10" part of a date matching.
+const PDF_MONEY = /(?<![\d/\.\-])(?:₹\s*)?(?:-|\()?\s*(?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2}\)?(?:\s*(?:CR|DR))?(?![\d\.])/gi;
+
+function pdfMoneyTokens(line: string): PdfMoney[] {
+  return [...line.matchAll(PDF_MONEY)].flatMap((match) => {
+    const raw = match[0].trim();
+    const parsed = parseAmount(raw);
+    if (parsed === null) return [];
+    const direction: Direction = /\b(?:CR|CREDIT)\b/i.test(raw)
+      ? "Credit"
+      : /\b(?:DR|DEBIT)\b/i.test(raw) || /^[₹\s]*(?:-|\()/.test(raw)
+        ? "Debit"
+        : "Unknown";
+    return [{ raw, value: Math.abs(parsed), start: match.index ?? 0, direction }];
   });
+}
+
+function pdfStatementOrder(blocks: PdfStatementBlock[]) {
+  for (let index = 1; index < blocks.length; index += 1) {
+    const previous = blocks[index - 1].date.iso;
+    const current = blocks[index].date.iso;
+    if (current !== previous) return current > previous ? "ascending" : "descending";
+  }
+  return "ascending" as const;
+}
+
+function pdfBalance(block: PdfStatementBlock) {
+  return block.money.length >= 2 ? block.money[block.money.length - 1].value : null;
+}
+
+function pdfBalanceTrend(blocks: PdfStatementBlock[], index: number, order: "ascending" | "descending"): BalanceTrend | null {
+  const neighbouringIndex = order === "ascending" ? index - 1 : index + 1;
+  const currentBalance = pdfBalance(blocks[index]);
+  const neighbouringBalance = blocks[neighbouringIndex] ? pdfBalance(blocks[neighbouringIndex]) : null;
+  if (currentBalance === null || neighbouringBalance === null) return null;
+  const delta = currentBalance - neighbouringBalance;
+  if (Math.abs(delta) < 0.005) return null;
+  return { direction: delta > 0 ? "Credit" : "Debit", amount: Math.abs(delta) };
+}
+
+function nearestAmount(candidates: PdfMoney[], target: number) {
+  return candidates.reduce<PdfMoney | null>((closest, candidate) => {
+    if (!closest || Math.abs(candidate.value - target) < Math.abs(closest.value - target)) return candidate;
+    return closest;
+  }, null);
+}
+
+// PDF text is extracted in visual lines, not database rows. A transaction's date, wrapped
+// narration and amount columns can therefore be on three different lines. Scan from a dated
+// line to the next line that contains actual money values, then reconstruct one statement row.
+function pdfTextToRows(text: string): unknown[][] {
+  const blocks: PdfStatementBlock[] = [];
+  let active: PdfStatementBlock | null = null;
+
+  const completeActiveBlock = () => {
+    if (active?.money.length) blocks.push(active);
+    active = null;
+  };
+
+  const addLineToActiveBlock = (line: string) => {
+    if (!active) return;
+    const money = pdfMoneyTokens(line);
+    if (!money.length) {
+      if (line) active.narrationParts.push(line);
+      return;
+    }
+    const narrationPrefix = clean(line.slice(0, money[0].start));
+    if (narrationPrefix) active.narrationParts.push(narrationPrefix);
+    active.money = money;
+    completeActiveBlock();
+  };
+
+  text.split(/\n+/).forEach((rawLine) => {
+    const line = clean(rawLine);
+    if (!line) return;
+    const dateMatch = line.match(PDF_DATE_AT_START);
+    if (!dateMatch) {
+      addLineToActiveBlock(line);
+      return;
+    }
+    completeActiveBlock();
+    const date = parseIndianDate(dateMatch[1]);
+    if (!date) return;
+    active = { date, narrationParts: [], money: [] };
+    addLineToActiveBlock(clean(line.slice(dateMatch[0].length)));
+  });
+  completeActiveBlock();
+
+  const order = pdfStatementOrder(blocks);
+  const rows: unknown[][] = [["Date", "Narration", "Withdrawal", "Deposit", "Balance", "Amount"]];
+
+  blocks.forEach((block, index) => {
+    // The final value is the running balance whenever two or more money values are printed.
+    // The preceding two values, when present, are the conventional Debit / Credit columns.
+    const layout = block.money.length > 3 ? block.money.slice(-3) : block.money;
+    const amountColumns = layout.length >= 2 ? layout.slice(0, -1) : layout;
+    const candidates = amountColumns.filter((money) => money.value > 0);
+    if (!candidates.length) return;
+
+    const trend = pdfBalanceTrend(blocks, index, order);
+    let direction = amountColumns.find((money) => money.direction !== "Unknown")?.direction ?? "Unknown";
+    let amount: PdfMoney | null = null;
+
+    if (amountColumns.length === 2) {
+      const [debit, credit] = amountColumns;
+      if (debit.value > 0 && credit.value === 0) { direction = "Debit"; amount = debit; }
+      else if (credit.value > 0 && debit.value === 0) { direction = "Credit"; amount = credit; }
+    }
+
+    if (direction === "Unknown" && trend) direction = trend.direction;
+    if (!amount) {
+      if (amountColumns.length === 2 && direction === "Debit") amount = amountColumns[0];
+      else if (amountColumns.length === 2 && direction === "Credit") amount = amountColumns[1];
+      else if (trend) amount = nearestAmount(candidates, trend.amount);
+      else amount = candidates[0];
+    }
+    if (!amount || !amount.value) return;
+
+    const narration = clean(block.narrationParts.join(" ")) || "Statement transaction";
+    const balance = layout.length >= 2 ? layout[layout.length - 1].raw : "";
+    const withdrawal = direction === "Debit" ? amount.raw : "";
+    const deposit = direction === "Credit" ? amount.raw : "";
+    rows.push([block.date.display, narration, withdrawal, deposit, balance, amount.raw]);
+  });
+
   return rows;
 }
 
