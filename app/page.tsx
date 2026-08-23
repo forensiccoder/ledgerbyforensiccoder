@@ -266,13 +266,10 @@ async function parseFile(file: File): Promise<ParsedFile> {
   }
   if (extension === "pdf") {
     const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-    // pdfjs needs an explicit worker script or it fails (or silently hangs) the moment
-    // getDocument() is called — it doesn't reliably auto-resolve one under Vite/webpack.
-    // This was previously unset, so every PDF upload failed regardless of its contents.
-    pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-      "pdfjs-dist/legacy/build/pdf.worker.mjs",
-      import.meta.url,
-    ).toString();
+    // pdfjs needs an explicit browser-reachable worker or it can fail (or silently hang)
+    // as getDocument() starts. Use the installed library version so its worker API matches.
+    pdfjs.GlobalWorkerOptions.workerSrc =
+      `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/legacy/build/pdf.worker.min.mjs`;
     const pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
     const lines: string[] = [];
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
