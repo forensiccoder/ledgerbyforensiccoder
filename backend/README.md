@@ -55,6 +55,22 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
+### System dependencies (OS packages)
+
+`pip install` alone is not enough — several packages in `requirements.txt` are thin wrappers
+around native binaries that must be installed separately at the OS level:
+
+| Package (pip)          | Needs (system binary) | macOS (Homebrew)                    | Debian/Ubuntu (apt)                          |
+| ----------------------- | ---------------------- | ------------------------------------ | ---------------------------------------------- |
+| `pytesseract`           | `tesseract`             | `brew install tesseract`              | `apt install tesseract-ocr`                     |
+| `camelot-py`             | Ghostscript              | `brew install ghostscript`             | `apt install ghostscript`                        |
+| `ocrmypdf`                | Ghostscript + Poppler     | `brew install ghostscript poppler`      | `apt install ghostscript poppler-utils`           |
+
+Without these, the pip packages import fine but fail at runtime the first time they actually try
+to OCR a page or extract a table (e.g. `pytesseract.TesseractNotFoundError`, or Camelot/OCRmyPDF
+erroring out looking for `gs`/`pdftoppm`). Install them before deploying anywhere OCR or
+Camelot/OCRmyPDF extraction is expected to run, including CI and Docker images.
+
 Then `POST /api/analyze` with `multipart/form-data`: `file` (required), `password` (optional, for
 encrypted PDFs), `ocrMode` (`auto` | `force` | `off`, default `auto`). `POST /api/export` takes
 the same fields plus `format` (`xlsx` | `csv`) and streams back a download.

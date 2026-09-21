@@ -10,5 +10,10 @@ pytesseract>=0.3.10
 Pillow>=10.0
 openpyxl>=3.1
 
+# Alternative/supplementary PDF extraction backends
+pymupdf>=1.24
+camelot-py>=1.0
+ocrmypdf>=15.4
+
 # Optional: only needed if you also want XLS (legacy) input support
 # xlrd>=2.0
