@@ -78,6 +78,10 @@ the same fields plus `format` (`xlsx` | `csv`) and streams back a download.
 Set `LEDGERLENS_ALLOWED_ORIGINS` (comma-separated) to the real frontend origin(s) in production;
 it defaults to `http://localhost:3000`.
 
+If this port (`8000`) is already taken on your machine, run uvicorn with a different `--port` and
+point the frontend at it via `NEXT_PUBLIC_LEDGERLENS_API_URL` — see `.env.local.example` in the
+repo root.
+
 ## Testing
 
 `pytest` and `PyMuPDF` could not be installed in the sandbox used to build this (no package-index
