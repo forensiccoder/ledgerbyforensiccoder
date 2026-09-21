@@ -39,371 +39,57 @@ const numberFormatter = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 2,
 });
 
-const clean = (value: unknown) => String(value ?? "").replace(/\s+/g, " ").trim();
+// Extraction, OCR and narration classification now happen server-side (see backend/, a Python/
+// FastAPI service using pdfplumber for PDF tables, pytesseract for scanned pages, and regex-based
+// narration parsing) rather than in the browser. This keeps one classification pipeline instead of
+// two, and makes scanned statements (which pdfjs-dist text extraction cannot read at all) work.
+const API_BASE = (process.env.NEXT_PUBLIC_LEDGERLENS_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 
-function parseAmount(value: unknown): number | null {
-  const text = clean(value).replace(/[₹\s]/g, "");
-  if (!text || /^(?:-|n\/?a)$/i.test(text)) return null;
-  const negative = /^\(.*\)$/.test(text) || /\bDR\b/i.test(text);
-  const numeric = Number(text.replace(/[(),]/g, "").replace(/(?:CR|DR)$/i, ""));
-  if (!Number.isFinite(numeric)) return null;
-  return negative ? -Math.abs(numeric) : Math.abs(numeric);
-}
-
-function parseIndianDate(value: unknown): { display: string; iso: string } | null {
-  if (typeof value === "number" && value > 20000 && value < 80000) {
-    const utc = new Date(Date.UTC(1899, 11, 30) + value * 86400000);
-    return toDateParts(utc.getUTCFullYear(), utc.getUTCMonth() + 1, utc.getUTCDate());
-  }
-  const text = clean(value);
-  if (!text) return null;
-  const numeric = text.match(/(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
-  if (numeric) {
-    let year = Number(numeric[3]);
-    if (year < 100) year += year > 70 ? 1900 : 2000;
-    return toDateParts(year, Number(numeric[2]), Number(numeric[1]));
-  }
-  const named = text.match(/(\d{1,2})[\s\-]([A-Za-z]{3,9})[\s,\-](\d{2,4})/);
-  if (named) {
-    const month = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(
-      named[2].slice(0, 3).toLowerCase(),
-    );
-    let year = Number(named[3]);
-    if (year < 100) year += 2000;
-    return month >= 0 ? toDateParts(year, month + 1, Number(named[1])) : null;
-  }
-  return null;
-}
-
-function toDateParts(year: number, month: number, day: number) {
-  const test = new Date(Date.UTC(year, month - 1, day));
-  if (test.getUTCFullYear() !== year || test.getUTCMonth() !== month - 1 || test.getUTCDate() !== day) return null;
-  const display = new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" }).format(test);
-  return { display, iso: `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}` };
-}
-
-function normaliseKey(key: unknown) {
-  return clean(key).toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
-function findValue(row: Record<string, unknown>, patterns: string[]) {
-  const entry = Object.entries(row).find(([key]) => patterns.some((pattern) => normaliseKey(key).includes(pattern)));
-  return entry ? entry[1] : "";
-}
-
-// Many Indian bank exports print "0.00" in whichever of Debit/Credit does not
-// apply, instead of leaving it blank. parseAmount("0.00") is a real number
-// (0), not null, so treating it as "the amount" was silently zeroing out
-// every debit row. nonZero folds 0 back into "not actually provided" so the
-// other column (or the narration/indicator fallback) gets used instead.
-function nonZero(value: number | null): number | null {
-  return value === null || value === 0 ? null : value;
-}
-
-function getDirection(row: Record<string, unknown>, narration: string, debit: unknown, credit: unknown): Direction {
-  if (nonZero(parseAmount(credit)) !== null) return "Credit";
-  if (nonZero(parseAmount(debit)) !== null) return "Debit";
-  const indicator = clean(findValue(row, ["drcr", "crdr", "type", "transactiontype"]));
-  if (/\b(cr|credit)\b/i.test(indicator)) return "Credit";
-  if (/\b(dr|debit)\b/i.test(indicator)) return "Debit";
-  if (/\b(cr|credit)\b/i.test(narration)) return "Credit";
-  if (/\b(dr|debit|withdrawal)\b/i.test(narration)) return "Debit";
-  return "Unknown";
-}
-
-function categorise(narration: string, direction: Direction): Category {
-  const text = narration.toLowerCase();
-  if (/\bupi\b|upi[\/-]|\b(phonepe|gpay|google pay|paytm|bhim)\b/.test(text)) return "UPI";
-  if (/\bneft\b/.test(text)) return "NEFT";
-  if (/\bcash\s*(deposit|dep|received|credit)|\bby\s+cash\b/.test(text) || (direction === "Credit" && /\bcash\b/.test(text))) return "Cash deposit";
-  if (/\b(cash\s*(withdrawal|withdraw|wd|w\/d)|atm\s*(cash|withdrawal)?|cash withdrawal)\b/.test(text) || (direction === "Debit" && /\bcash\b/.test(text))) return "Cash withdrawal";
-  return "Other";
-}
-
-function findReference(narration: string, explicit: unknown) {
-  const existing = clean(explicit);
-  if (existing) return existing;
-  const match = narration.match(/(?:UTR|REF|TXN|RRN)[\s:/\-#]*([A-Z0-9]{6,})/i) || narration.match(/\b[A-Z]{4,}\d{8,}\b/);
-  return match ? clean(match[1] || match[0]) : "—";
-}
-
-function inferBeneficiary(narration: string, explicit: unknown, category: Category) {
-  const supplied = clean(explicit);
-  if (supplied && !/^(?:na|n\/a|-|nil)$/i.test(supplied)) return supplied;
-  if (category === "Cash deposit") return "Cash deposit";
-  if (category === "Cash withdrawal") return "Cash withdrawal";
-  const trimmed = narration
-    .replace(/\b(?:NEFT|UPI|IMPS|RTGS|INB|P2A|P2M|DR|CR|DEBIT|CREDIT)\b/gi, " ")
-    .replace(/(?:UTR|REF|TXN|RRN)[\s:/\-#]*[A-Z0-9]{6,}/gi, " ")
-    .replace(/\b[A-Z]{4}[A-Z0-9]{7,}\b/g, " ");
-  const vpa = trimmed.match(/\b[A-Z0-9._-]+@[A-Z0-9._-]+\b/i);
-  if (vpa) return vpa[0];
-  const candidates = trimmed
-    .split(/[|/]/)
-    .map((part) => clean(part.replace(/^[\-:;,\s]+|[\-:;,\s]+$/g, "")))
-    .filter((part) => part.length > 2 && !/^\d+(?:\.\d+)?$/.test(part) && !/^(?:to|from|transfer|payment|bank)$/i.test(part));
-  const candidate = candidates.find((part) => /[a-z]/i.test(part));
-  return candidate ? candidate.slice(0, 80) : "Review narration";
-}
-
-function rowsToTransactions(rows: unknown[][], source: string): ParsedFile {
-  const usableRows = rows.filter((row) => row.some((cell) => clean(cell)));
-  const headerIndex = usableRows.findIndex((row) => {
-    const cells = row.map(normaliseKey);
-    return cells.some((cell) => cell.includes("date")) && cells.some((cell) => /narration|description|particular|remark|detail/.test(cell));
-  });
-  const headers = headerIndex >= 0 ? usableRows[headerIndex].map((cell, index) => clean(cell) || `Column ${index + 1}`) : ["Date", "Narration", "Amount"];
-  const dataRows = headerIndex >= 0 ? usableRows.slice(headerIndex + 1) : usableRows;
-  const transactions: Transaction[] = [];
-  let unclassified = 0;
-
-  dataRows.forEach((cells, index) => {
-    const row: Record<string, unknown> = {};
-    headers.forEach((header, cellIndex) => {
-      row[header] = cells[cellIndex] ?? "";
-    });
-    const dateValue = findValue(row, ["transactiondate", "txn date", "date", "valuedate"]);
-    const date = parseIndianDate(dateValue || cells[0]);
-    const narration = clean(findValue(row, ["narration", "description", "particular", "remark", "detail", "transaction"]));
-    if (!date || !narration) return;
-    const debit = findValue(row, ["withdrawal", "debit", "dramount", "debitamount"]);
-    const credit = findValue(row, ["deposit", "credit", "cramount", "creditamount"]);
-    const amountValue = findValue(row, ["amount", "transactionamount"]);
-    const direction = getDirection(row, narration, debit, credit);
-    const amount = Math.abs(nonZero(parseAmount(credit)) ?? nonZero(parseAmount(debit)) ?? nonZero(parseAmount(amountValue)) ?? 0);
-    if (!amount) return;
-    const category = categorise(narration, direction);
-    if (category === "Other") unclassified += 1;
-    transactions.push({
-      id: `${source}-${index}-${date.iso}-${amount}`,
-      date: date.display,
-      dateIso: date.iso,
-      category,
-      direction,
-      beneficiary: inferBeneficiary(narration, findValue(row, ["beneficiary", "payee", "counterparty", "partyname"]), category),
-      narration,
-      reference: findReference(narration, findValue(row, ["reference", "utr", "rrn", "transactionid", "txn id"])),
-      amount,
-      source,
-    });
-  });
-  return { transactions, totalRows: dataRows.length, unclassified };
-}
-
-function parseCsv(text: string) {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let quoted = false;
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    if (char === '"' && text[index + 1] === '"') { cell += '"'; index += 1; }
-    else if (char === '"') quoted = !quoted;
-    else if (char === "," && !quoted) { row.push(cell); cell = ""; }
-    else if ((char === "\n" || char === "\r") && !quoted) {
-      if (char === "\r" && text[index + 1] === "\n") index += 1;
-      row.push(cell); rows.push(row); row = []; cell = "";
-    } else cell += char;
-  }
-  if (cell || row.length) { row.push(cell); rows.push(row); }
-  return rows;
-}
-
-type PdfMoney = {
-  raw: string;
-  value: number;
-  start: number;
-  direction: Direction;
+type ApiTransaction = {
+  id: string; date: string; dateIso: string; category: Category; direction: Direction;
+  beneficiary: string; reference: string; narration: string; amount: number; source: string;
 };
 
-type PdfStatementBlock = {
-  date: { display: string; iso: string };
-  narrationParts: string[];
-  money: PdfMoney[];
-};
+type ApiError = { code: string; message: string };
 
-type BalanceTrend = { direction: Exclude<Direction, "Unknown">; amount: number };
-
-const PDF_DATE_AT_START = /^\s*((?:\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})|(?:\d{1,2}[\s\-]+[A-Za-z]{3,9}[\s,\-]+\d{2,4}))(?=\s|$)/;
-// A decimal component is deliberate: long reference numbers such as 1386030000001304 are
-// identifiers, not money. The guards also prevent the "01.10" part of a date matching.
-const PDF_MONEY = /(?<![\d/\.\-])(?:₹\s*)?(?:-|\()?\s*(?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2}\)?(?:\s*(?:CR|DR))?(?![\d\.])/gi;
-
-function pdfMoneyTokens(line: string): PdfMoney[] {
-  return [...line.matchAll(PDF_MONEY)].flatMap((match) => {
-    const raw = match[0].trim();
-    const parsed = parseAmount(raw);
-    if (parsed === null) return [];
-    const direction: Direction = /\b(?:CR|CREDIT)\b/i.test(raw)
-      ? "Credit"
-      : /\b(?:DR|DEBIT)\b/i.test(raw) || /^[₹\s]*(?:-|\()/.test(raw)
-        ? "Debit"
-        : "Unknown";
-    return [{ raw, value: Math.abs(parsed), start: match.index ?? 0, direction }];
-  });
-}
-
-function pdfStatementOrder(blocks: PdfStatementBlock[]) {
-  for (let index = 1; index < blocks.length; index += 1) {
-    const previous = blocks[index - 1].date.iso;
-    const current = blocks[index].date.iso;
-    if (current !== previous) return current > previous ? "ascending" : "descending";
+// PASSWORD_REQUIRED (401) surfaces as a thrown error carrying the code, so the caller can prompt
+// for a password and retry the same file instead of just showing a generic failure message.
+class StatementApiError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
   }
-  return "ascending" as const;
 }
 
-function pdfBalance(block: PdfStatementBlock) {
-  return block.money.length >= 2 ? block.money[block.money.length - 1].value : null;
-}
-
-function pdfBalanceTrend(blocks: PdfStatementBlock[], index: number, order: "ascending" | "descending"): BalanceTrend | null {
-  const neighbouringIndex = order === "ascending" ? index - 1 : index + 1;
-  const currentBalance = pdfBalance(blocks[index]);
-  const neighbouringBalance = blocks[neighbouringIndex] ? pdfBalance(blocks[neighbouringIndex]) : null;
-  if (currentBalance === null || neighbouringBalance === null) return null;
-  const delta = currentBalance - neighbouringBalance;
-  if (Math.abs(delta) < 0.005) return null;
-  return { direction: delta > 0 ? "Credit" : "Debit", amount: Math.abs(delta) };
-}
-
-function nearestAmount(candidates: PdfMoney[], target: number) {
-  return candidates.reduce<PdfMoney | null>((closest, candidate) => {
-    if (!closest || Math.abs(candidate.value - target) < Math.abs(closest.value - target)) return candidate;
-    return closest;
-  }, null);
-}
-
-// PDF text is extracted in visual lines, not database rows. A transaction's date, wrapped
-// narration and amount columns can therefore be on three different lines. Scan from a dated
-// line to the next line that contains actual money values, then reconstruct one statement row.
-function pdfTextToRows(text: string): unknown[][] {
-  const blocks: PdfStatementBlock[] = [];
-  let active: PdfStatementBlock | null = null;
-
-  const completeActiveBlock = () => {
-    if (active?.money.length) blocks.push(active);
-    active = null;
+async function analyzeFile(file: File, password?: string): Promise<ParsedFile> {
+  const body = new FormData();
+  body.append("file", file);
+  if (password) body.append("password", password);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body });
+  } catch {
+    throw new Error(`Could not reach the LedgerLens API at ${API_BASE}. Is the backend running?`);
+  }
+  if (!response.ok) {
+    const error = (await response.json().catch(() => null)) as ApiError | null;
+    throw new StatementApiError(error?.code ?? "UNKNOWN", error?.message ?? "That file could not be read.");
+  }
+  const data = await response.json() as {
+    transactions: ApiTransaction[];
+    totalRows: number;
+    summary: { otherCount: number };
   };
-
-  const addLineToActiveBlock = (line: string) => {
-    if (!active) return;
-    const money = pdfMoneyTokens(line);
-    if (!money.length) {
-      if (line) active.narrationParts.push(line);
-      return;
-    }
-    const narrationPrefix = clean(line.slice(0, money[0].start));
-    if (narrationPrefix) active.narrationParts.push(narrationPrefix);
-    active.money = money;
-    completeActiveBlock();
+  return {
+    transactions: data.transactions.map((t) => ({
+      id: t.id, date: t.date, dateIso: t.dateIso, category: t.category, direction: t.direction,
+      beneficiary: t.beneficiary, narration: t.narration, reference: t.reference || "—",
+      amount: t.amount, source: t.source,
+    })),
+    totalRows: data.totalRows,
+    unclassified: data.summary.otherCount,
   };
-
-  text.split(/\n+/).forEach((rawLine) => {
-    const line = clean(rawLine);
-    if (!line) return;
-    const dateMatch = line.match(PDF_DATE_AT_START);
-    if (!dateMatch) {
-      addLineToActiveBlock(line);
-      return;
-    }
-    completeActiveBlock();
-    const date = parseIndianDate(dateMatch[1]);
-    if (!date) return;
-    active = { date, narrationParts: [], money: [] };
-    let remainder = clean(line.slice(dateMatch[0].length));
-    // Utkarsh-style statements print Transaction Date and Value Date side by side. Keep the
-    // first (transaction) date, but do not let the identical value date become narration.
-    const valueDateMatch = remainder.match(PDF_DATE_AT_START);
-    if (valueDateMatch && parseIndianDate(valueDateMatch[1])?.iso === date.iso) {
-      remainder = clean(remainder.slice(valueDateMatch[0].length));
-    }
-    addLineToActiveBlock(remainder);
-  });
-  completeActiveBlock();
-
-  const order = pdfStatementOrder(blocks);
-  const rows: unknown[][] = [["Date", "Narration", "Withdrawal", "Deposit", "Balance", "Amount"]];
-
-  blocks.forEach((block, index) => {
-    // The final value is the running balance whenever two or more money values are printed.
-    // The preceding two values, when present, are the conventional Debit / Credit columns.
-    const layout = block.money.length > 3 ? block.money.slice(-3) : block.money;
-    const amountColumns = layout.length >= 2 ? layout.slice(0, -1) : layout;
-    const candidates = amountColumns.filter((money) => money.value > 0);
-    if (!candidates.length) return;
-
-    const trend = pdfBalanceTrend(blocks, index, order);
-    let direction = amountColumns.find((money) => money.direction !== "Unknown")?.direction ?? "Unknown";
-    let amount: PdfMoney | null = null;
-
-    if (amountColumns.length === 2) {
-      const [debit, credit] = amountColumns;
-      if (debit.value > 0 && credit.value === 0) { direction = "Debit"; amount = debit; }
-      else if (credit.value > 0 && debit.value === 0) { direction = "Credit"; amount = credit; }
-    }
-
-    if (direction === "Unknown" && trend) direction = trend.direction;
-    if (!amount) {
-      if (amountColumns.length === 2 && direction === "Debit") amount = amountColumns[0];
-      else if (amountColumns.length === 2 && direction === "Credit") amount = amountColumns[1];
-      else if (trend) amount = nearestAmount(candidates, trend.amount);
-      else amount = candidates[0];
-    }
-    if (!amount || !amount.value) return;
-
-    const narration = clean(block.narrationParts.join(" ")) || "Statement transaction";
-    const balance = layout.length >= 2 ? layout[layout.length - 1].raw : "";
-    const withdrawal = direction === "Debit" ? amount.raw : "";
-    const deposit = direction === "Credit" ? amount.raw : "";
-    rows.push([block.date.display, narration, withdrawal, deposit, balance, amount.raw]);
-  });
-
-  return rows;
-}
-
-async function parseFile(file: File): Promise<ParsedFile> {
-  const extension = file.name.split(".").pop()?.toLowerCase();
-  if (extension === "csv") return rowsToTransactions(parseCsv(await file.text()), file.name);
-  if (extension === "xlsx" || extension === "xls") {
-    const XLSX = await import("xlsx");
-    const workbook = XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: false });
-    const rows = workbook.SheetNames.flatMap((name) => XLSX.utils.sheet_to_json<unknown[]>(workbook.Sheets[name], { header: 1, defval: "", raw: true }));
-    return rowsToTransactions(rows, file.name);
-  }
-  if (extension === "pdf") {
-    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-    // pdfjs needs an explicit browser-reachable worker or it can fail (or silently hang)
-    // as getDocument() starts. Use the installed library version so its worker API matches.
-    pdfjs.GlobalWorkerOptions.workerSrc =
-      `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/legacy/build/pdf.worker.min.mjs`;
-    const pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
-    const lines: string[] = [];
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-      const content = await (await pdf.getPage(pageNumber)).getTextContent();
-      const items = content.items.filter((item): item is { str: string; transform: number[] } => "str" in item);
-      // Group text fragments into visual lines by Y position. Using an exact rounded match
-      // was too strict — sub-pixel baseline differences between columns on the same printed
-      // row (common in table layouts) split one row into several, breaking date/amount
-      // extraction. A small tolerance keeps genuinely same-row fragments together.
-      const positioned = items
-        .map((item) => ({ x: item.transform[4], y: item.transform[5], str: item.str }))
-        .sort((a, b) => b.y - a.y || a.x - b.x);
-      const grouped: { y: number; items: { x: number; str: string }[] }[] = [];
-      const TOLERANCE = 2.5;
-      positioned.forEach((item) => {
-        const line = grouped.find((candidate) => Math.abs(candidate.y - item.y) <= TOLERANCE);
-        if (line) line.items.push({ x: item.x, str: item.str });
-        else grouped.push({ y: item.y, items: [{ x: item.x, str: item.str }] });
-      });
-      grouped.forEach((line) => {
-        lines.push(line.items.sort((a, b) => a.x - b.x).map((item) => item.str).join(" "));
-      });
-    }
-    const result = rowsToTransactions(pdfTextToRows(lines.join("\n")), file.name);
-    if (!result.transactions.length) throw new Error("No readable transaction rows were found. If this is a scanned PDF (a photo or a scan rather than a downloaded statement), run OCR first or upload the CSV/XLSX statement instead.");
-    return result;
-  }
-  throw new Error("Please upload a PDF, CSV, XLSX or XLS bank statement.");
 }
 
 function formatAmount(amount: number) { return numberFormatter.format(amount); }
@@ -430,16 +116,22 @@ export default function Home() {
     return { category, count: matches.length, amount: matches.reduce((sum, transaction) => sum + transaction.amount, 0) };
   }), [targetTransactions]);
 
-  const handleUpload = async (file?: File) => {
+  const handleUpload = async (file?: File, password?: string) => {
     if (!file) return;
     setStatus("processing"); setMessage(""); setFileName(file.name);
     try {
-      const parsed = await parseFile(file);
+      const parsed = await analyzeFile(file, password);
       setTransactions(parsed.transactions);
       setStatus("ready");
       const detected = parsed.transactions.length - parsed.unclassified;
       setMessage(`${detected} target transactions detected from ${parsed.totalRows} statement rows. ${parsed.unclassified ? `${parsed.unclassified} non-target rows were kept out of the review list.` : ""}`);
     } catch (error) {
+      // Password-protected PDFs get a second chance: prompt once and retry with what's typed.
+      // A blank/cancelled prompt is treated as giving up rather than looping forever.
+      if (error instanceof StatementApiError && (error.code === "PASSWORD_REQUIRED" || error.code === "WRONG_PASSWORD")) {
+        const entered = window.prompt(error.code === "WRONG_PASSWORD" ? "That password was incorrect. Try again:" : "This PDF is password-protected. Enter the password:");
+        if (entered) { void handleUpload(file, entered); return; }
+      }
       setTransactions([]); setStatus("error"); setMessage(error instanceof Error ? error.message : "We could not read that file.");
     }
   };
@@ -473,14 +165,14 @@ export default function Home() {
     <main>
       <header className="topbar">
         <a className="brand" href="#top" aria-label="LedgerLens home"><span className="brand-mark">L</span><span>Ledger<span>Lens</span></span></a>
-        <div className="topbar-note"><span className="live-dot" />Local processing. No statement storage.</div>
+        <div className="topbar-note"><span className="live-dot" />Analysed on request. No statement storage.</div>
       </header>
 
       <section className="hero" id="top">
         <div className="eyebrow">Forensic transaction review</div>
         <h1>See the story inside<br /><em>every statement.</em></h1>
         <p>Upload an Indian bank statement and isolate cash, NEFT and UPI activity in a review-ready ledger.</p>
-        <div className="hero-pills"><span>PDF</span><span>CSV</span><span>XLSX</span><span>Browser-based analysis</span></div>
+        <div className="hero-pills"><span>PDF</span><span>CSV</span><span>XLSX</span><span>Server-side OCR</span></div>
       </section>
 
       <section className="workspace" aria-label="Bank statement analysis workspace">
@@ -498,7 +190,7 @@ export default function Home() {
           <button className="button button-dark" type="button" onClick={() => fileInput.current?.click()} disabled={status === "processing"}>{status === "processing" ? "Analysing" : "Select statement"}</button>
           <input ref={fileInput} type="file" accept=".pdf,.csv,.xlsx,.xls,application/pdf,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={onInput} />
         </div>
-        <div className={`privacy-line ${status === "error" ? "error" : ""}`}><span>{status === "error" ? "!" : "✓"}</span>{message || "Your document stays on this device. Scanned PDFs should be OCR’d before upload."}</div>
+        <div className={`privacy-line ${status === "error" ? "error" : ""}`}><span>{status === "error" ? "!" : "✓"}</span>{message || "Statements are sent to the LedgerLens analysis service for extraction. Scanned PDFs are OCR'd automatically."}</div>
 
         <div className="summary-grid">
           {totals.map((total) => <button key={total.category} className={`summary-card ${categoryClass[total.category]} ${activeCategory === total.category ? "active" : ""}`} onClick={() => setActiveCategory(activeCategory === total.category ? "All" : total.category)} type="button"><span>{total.category}</span><strong>{total.count.toLocaleString("en-IN")}</strong><small>{formatAmount(total.amount)}</small></button>)}
@@ -517,7 +209,7 @@ export default function Home() {
         </div>
       </section>
 
-      <section className="method"><div><span className="section-kicker">Made for the evidence trail</span><h2>Structured for review.<br />Built for speed.</h2></div><div className="method-items"><p><b>01</b>Statement is read in the browser</p><p><b>02</b>Transaction dates are normalised in Indian date format</p><p><b>03</b>Excel export creates a separate sheet for each category</p></div></section>
+      <section className="method"><div><span className="section-kicker">Made for the evidence trail</span><h2>Structured for review.<br />Built for speed.</h2></div><div className="method-items"><p><b>01</b>Statement is parsed by the analysis service</p><p><b>02</b>Transaction dates are normalised in Indian date format</p><p><b>03</b>Excel export creates a separate sheet for each category</p></div></section>
       <footer className="site-footer"><span>LedgerLens</span><span>Forensic statement analysis</span><span>Designed for Indian bank statement formats</span></footer>
     </main>
   );
