@@ -270,12 +270,16 @@ _CASH_DEP = re.compile(
 )
 _CASH_WDL = re.compile(
     r"\b(?:cash\s*[-/.]?\s*(?:wdl|wd|wdrl|withdrawal|withdraw|out)|csh\s*[-/.]?\s*wd\w*|"
-    r"atm\s*[-/.]?\s*(?:wdl|wd|wdrl|cash|csh|withdrawal)|nfs|atw|nwd|eaw|awb|cwdr)\b",
+    r"atm\s*[-/.]?\s*(?:wdl|wd|wdrl|cash|csh|withdrawal)|nfs|atw|nwd|eaw|awb|cwdr|wthdrl)\b",
     re.I,
 )
 _ATM_WORD = re.compile(r"\bATM\b", re.I)
 _CASH_WORD = re.compile(r"\bCASH\b", re.I)
 _CHEQUE_WORD = re.compile(r"\b(?:CHQ|CHEQUE|CHK)\b", re.I)
+# Broader than _CHEQUE_WORD: also catches "CLG"/"CLEARING", used to keep a bare "WTHDRL" that's
+# actually a cheque paid to a third party via clearing (e.g. "WTHDRL,CLG/000006/JOHN DOE") out of
+# Cash withdrawal - that money didn't go to the account holder as cash.
+_CHEQUE_OR_CLEARING_WORD = re.compile(r"\b(?:CHQ|CHEQUE|CHK|CLG|CLEARING)\b", re.I)
 _SELF_WORD = re.compile(r"\bSELF\b", re.I)
 _REVERSAL = re.compile(r"\b(?:rev|reversal|reversed|refund|return(?:ed)?|failed|reject(?:ed)?|unpaid)\b", re.I)
 _REF_LABELLED = re.compile(
@@ -286,7 +290,7 @@ _OTHER_CHANNELS = (
     ("IMPS", re.compile(r"(?<![A-Z0-9])IMPS(?![A-Z0-9])", re.I)),
     ("RTGS", re.compile(r"(?<![A-Z0-9])RTGS(?![A-Z0-9])", re.I)),
     ("ECS/NACH", re.compile(r"\b(?:ECS|NACH|ACH)\b", re.I)),
-    ("Cheque", re.compile(r"\b(?:CHQ|CHEQUE|CHK|CLG|CLEARING)\b", re.I)),
+    ("Cheque", _CHEQUE_OR_CLEARING_WORD),
     ("Card (POS/online)", re.compile(r"\b(?:POS|PCD|ECOM|E-COM)\b", re.I)),
     ("Interest", re.compile(r"\b(?:INT\.?\s*PD|INTEREST|INT\s+CREDIT)\b", re.I)),
 )
@@ -363,7 +367,11 @@ def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo
 
     # 4. Cash deposit / withdrawal
     is_dep = bool(_CASH_DEP.search(text))
-    is_wdl = bool(_CASH_WDL.search(text))
+    # A bare "WTHDRL" is unambiguous, but banks also write it as "WTHDRL,CLG/.../PAYEE NAME" for a
+    # cheque cleared to a third party - that's not cash into the account holder's hand, so a
+    # cheque/clearing reference alongside it should keep it out of Cash withdrawal (it still gets
+    # picked up by the "Cheque" entry in _OTHER_CHANNELS below).
+    is_wdl = bool(_CASH_WDL.search(text)) and not _CHEQUE_OR_CLEARING_WORD.search(text)
     if is_dep and not is_wdl:
         info.category = CASH_DEPOSIT
         info.channel = "CDM" if re.search(r"\b(?:cdm|bna)\b", text, re.I) else "Cash"
