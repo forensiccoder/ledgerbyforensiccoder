@@ -77,7 +77,11 @@ _ISO = r"(?P<iy>\d{4})-(?P<im>\d{2})-(?P<id>\d{2})"
 _NUM = r"(?P<d>\d{1,2})[/.\-](?P<m>\d{1,2})[/.\-](?P<y>\d{4}|\d{2})"
 _NAMED = r"(?P<nd>\d{1,2})[\s/.\-]*(?P<mon>[A-Za-z]{3,9})\.?[\s,/.\-]*(?P<ny>\d{4}|\d{2})"
 _DATE_ANY = re.compile(rf"(?<!\d)(?:{_ISO}|{_NUM}|{_NAMED})(?!\d)")
-_DATE_STRICT = re.compile(rf"^\s*(?:{_ISO}|{_NUM}|{_NAMED}){_TIME_TAIL}\s*$")
+# The trailing "[|\[\]lI]?" tolerates a single stray ruling-line artifact glued onto the date with
+# no space (e.g. "12-01-2026]") - without it, the whole token fails strict matching and the entire
+# row silently gets treated as a continuation of whatever transaction came before it instead of
+# starting its own.
+_DATE_STRICT = re.compile(rf"^\s*(?:{_ISO}|{_NUM}|{_NAMED}){_TIME_TAIL}\s*[|\[\]lI]?\s*$")
 
 EXCEL_EPOCH = datetime(1899, 12, 30)
 

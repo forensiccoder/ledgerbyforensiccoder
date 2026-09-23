@@ -326,7 +326,26 @@ def _date_spans(words: list[Word]) -> list[tuple[int, int]]:
     return spans
 
 
-_COMPLETE_PAISE = re.compile(r"\.\d{2}$")
+_COMPLETE_PAISE = re.compile(r"[.,]\d{2}$")
+
+
+def _fix_stray_decimal_separator(body: str) -> str:
+    """OCR sometimes misreads the decimal point as a comma, or duplicates it so an actual
+    thousands-grouping mark also comes out as one. Both are unambiguous to spot and fix without
+    touching a normally-formatted number: a genuine Indian-formatted integer's right-most group is
+    always three digits (e.g. "1,50,000"), so a comma followed by exactly two digits at the very
+    end is never valid grouping, only ever a misread "." (e.g. "324928,39" -> "324928.39"); and a
+    real amount never has more than one period, so a second one is always a misread "," (e.g.
+    "1021.42.93" -> "102142.93", not two decimal points).
+    """
+    if body.count(".") >= 2:
+        head, _, tail = body.rpartition(".")
+        return head.replace(".", "").replace(",", "") + "." + tail
+    if "." not in body:
+        m = re.search(r",(\d{2})$", body)
+        if m:
+            return body[: m.start()].replace(",", "") + "." + m.group(1)
+    return body
 
 
 def _fix_ocr_number(text: str) -> str:
@@ -334,10 +353,12 @@ def _fix_ocr_number(text: str) -> str:
     body, suffix = m.group(1), m.group(2) or ""
     # A table's vertical ruling line next to the column is often misread as a stray "|"/"l"/"I"
     # glued onto the very end of the number - if the amount is already complete (ends in two paise
-    # digits) without it, it's noise to drop, not a digit: the confusable-translation below would
-    # otherwise turn it into a spurious extra "1", e.g. "801601.67|" -> "801601.671".
+    # digits, with either a "." or a misread "," as the decimal marker - see below) without it,
+    # it's noise to drop, not a digit: the confusable-translation below would otherwise turn it
+    # into a spurious extra "1", e.g. "801601.67|" -> "801601.671".
     if body and body[-1] in "|lI" and _COMPLETE_PAISE.search(body[:-1]):
         body = body[:-1]
+    body = _fix_stray_decimal_separator(body)
     fixed = body.translate(str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "|": "1", "S": "5", "B": "8"}))
     return fixed + suffix if parse_money(fixed) is not None else text
 
