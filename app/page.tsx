@@ -123,7 +123,7 @@ export default function Home() {
       const parsed = await analyzeFile(file, password);
       setTransactions(parsed.transactions);
       setStatus("ready");
-      const detected = parsed.transactions.length - parsed.unclassified;
+      const detected = parsed.transactions.length;
       setMessage(`${detected} target transactions detected from ${parsed.totalRows} statement rows. ${parsed.unclassified ? `${parsed.unclassified} non-target rows were kept out of the review list.` : ""}`);
     } catch (error) {
       // Password-protected PDFs get a second chance: prompt once and retry with what's typed.
