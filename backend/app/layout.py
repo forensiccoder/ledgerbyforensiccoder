@@ -413,6 +413,9 @@ def _rows_from_columns(
     # Whether the row's own date line already carried narration text of its own (as opposed to
     # relying entirely on a wrapped prefix/continuation line) - see the note on ``run_end`` below.
     current_self_narrated = False
+    # Whether the row's own date line already carried a Debit/Credit/Balance value of its own -
+    # see the note on ``extra_numeric`` below.
+    current_has_numbers = False
     pending_prefix: list[Word] = []
 
     def blank() -> list[str]:
@@ -457,6 +460,7 @@ def _rows_from_columns(
         if _FOOTER.search(line.text):
             current = None
             current_self_narrated = False
+            current_has_numbers = False
             i += 1
             continue
         spans = _date_spans(ws)
@@ -476,10 +480,23 @@ def _rows_from_columns(
             # follows it, not to whatever row happened to come before.
             extra_numeric = [w for w in ws if is_money_like(w.text) and w.x1 >= first_num_x0 - 3 and text_cols]
             if extra_numeric:
+                if current is not None and not current_has_numbers:
+                    # The open row's own date line had no Debit/Credit/Balance of its own - the
+                    # same OCR line-split as the narration case above, just for the amount instead
+                    # of the narration: this line supplies the value that row was missing, not a
+                    # genuinely stray one to discard.
+                    for w in extra_numeric:
+                        col = min(right_cols, key=lambda c: abs(w.x1 - c.x1))
+                        if col.role in NUMERIC_ROLES:
+                            put(current, col, _fix_ocr_number(w.text) if ocr else w.text)
+                    current_has_numbers = True
+                    i += 1
+                    continue
                 if current is not None:
                     warnings.append(f"page {page}: a line with amounts but no date was skipped: {line.text[:60]!r}")
                     current = None
                     current_self_narrated = False
+                    current_has_numbers = False
                 i += 1
                 continue
             run_end = i
@@ -558,11 +575,13 @@ def _rows_from_columns(
             rows.append(RawRow(cells, page))
             current = None
             current_self_narrated = False
+            current_has_numbers = False
             i += 1
             continue
         rows.append(RawRow(cells, page))
         current = cells
         current_self_narrated = head_date is not None and has_own_narration(ws)
+        current_has_numbers = any(cells[index_of[id(c)]] for c in numeric_cols if id(c) in index_of)
         i += 1
     return rows
 
