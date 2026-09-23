@@ -20,7 +20,10 @@ _MONEY_RE = re.compile(
     (?P<num>\d[\d,]*(?:\.\d+)?|\.\d+)\s*
     (?:\(?\s*(?P<suffix>cr|dr)\.?\s*\)?)?\s*
     (?P<close>\))?
-    \s*$""",
+    \s*\|?\s*$""",
+    # The trailing "\|?" tolerates a stray "|" glued directly onto the number with no space - a
+    # table's vertical ruling line next to the Balance column is a common OCR misread on scanned
+    # statements, and without this it silently drops the value instead of just the noise character.
     re.I | re.X,
 )
 _EMPTY_MARKERS = {"", "-", "--", "—", "–", "na", "n/a", "nil", "null", "none"}

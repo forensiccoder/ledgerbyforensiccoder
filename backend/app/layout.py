@@ -182,6 +182,132 @@ def find_header(lines: list[Line], fuzzy: bool = False) -> tuple[int, int, list[
 
 
 # ----------------------------------------------------------------------------------------------
+# Headerless column inference
+#
+# Some scans genuinely never show a header row - e.g. the page carrying it wasn't included in the
+# scan. Dates and amounts still have a recognisable shape and a stable position even without a
+# label, and a Balance column is self-verifying: it is the one column where
+# ``balance[i] == balance[i-1] +/- amount[i]`` actually holds across rows. This tries every
+# plausible role assignment and keeps the one that reconciles - and only that one, above a
+# confidence bar - rather than silently mislabelling a Debit as a Credit.
+# ----------------------------------------------------------------------------------------------
+_DECIMAL_AMOUNT = re.compile(r"\.\d{1,2}\s*(?:cr|dr)?\.?\s*\|?\s*$", re.I)
+_MIN_SAMPLES = 5
+_MIN_RECONCILE_SCORE = 0.3
+
+
+def _cluster_by_anchor(items: list[Word], anchor, gap: float) -> list[list[Word]]:
+    ordered = sorted(items, key=anchor)
+    clusters: list[list[Word]] = []
+    for w in ordered:
+        a = anchor(w)
+        if clusters and a - anchor(clusters[-1][-1]) <= gap:
+            clusters[-1].append(w)
+        else:
+            clusters.append([w])
+    return clusters
+
+
+def infer_columns_from_data(lines: list[Line], page: int, ocr: bool) -> list[Column] | None:
+    all_words = [w for line in lines for w in line.words]
+    date_words = [w for w in all_words if parse_date(w.text, strict=True)]
+    if len(date_words) < _MIN_SAMPLES:
+        return None
+    date_gap = max(20.0, 4 * statistics.median(w.height for w in date_words))
+    date_clusters = sorted(_cluster_by_anchor(date_words, lambda w: w.x0, date_gap), key=len, reverse=True)
+    date_col_words = date_clusters[0]
+    if len(date_col_words) < _MIN_SAMPLES:
+        return None
+    date_x0 = min(w.x0 for w in date_col_words)
+    date_x1 = max(w.x1 for w in date_col_words)
+
+    # Amounts with paise (a decimal point + 1-2 digits) are real transaction values; a bare
+    # integer at a similar position is usually a transaction-type code printed in its own trailing
+    # column, not an amount - filtering to the decimal form keeps that code column from being
+    # mistaken for a fourth money column.
+    amount_words = [w for w in all_words if is_money_like(w.text) and _DECIMAL_AMOUNT.search(w.text)]
+    if len(amount_words) < _MIN_SAMPLES:
+        return None
+    amt_gap = max(20.0, 4 * statistics.median(w.height for w in amount_words))
+    num_clusters = [c for c in _cluster_by_anchor(amount_words, lambda w: w.x1, amt_gap) if len(c) >= _MIN_SAMPLES]
+    if len(num_clusters) not in (2, 3):
+        return None  # only the (debit, credit, balance) and (amount, balance) shapes are handled
+    num_clusters.sort(key=lambda c: min(w.x0 for w in c))
+    num_ranges = [(min(w.x0 for w in c), max(w.x1 for w in c)) for c in num_clusters]
+
+    narration_x0, narration_x1 = date_x1 + 4, min(r[0] for r in num_ranges) - 4
+    if narration_x1 <= narration_x0:
+        return None
+    date_col = Column("date", LABELS["date"], date_x0, date_x1)
+    narration_col = Column("narration", LABELS["narration"], narration_x0, narration_x1)
+
+    # A trailing code column (a bank's internal transaction-type number, printed right of Balance)
+    # was deliberately excluded from num_ranges above by requiring paise - but without a column of
+    # its own it would nearest-match Balance and get appended onto real balance values, corrupting
+    # them. Giving it an explicit role-less column (like a real header's trailing branch-code
+    # column) makes the row builder drop it instead, the same as it already does for those.
+    trailing_x0 = max(r[1] for r in num_ranges) + 4
+    trailing_words = [w for w in all_words if is_money_like(w.text) and w.x0 > trailing_x0]
+    extra_cols: list[Column] = []
+    if trailing_words:
+        extra_cols.append(Column(None, "", trailing_x0, max(w.x1 for w in trailing_words) + 4))
+
+    def trial_columns(role_by_range: dict[int, str]) -> list[Column]:
+        cols = [date_col, narration_col]
+        cols.extend(Column(role, LABELS[role], *num_ranges[i]) for i, role in role_by_range.items())
+        cols.extend(extra_cols)
+        return cols
+
+    def score(role_by_range: dict[int, str]) -> tuple[float, int]:
+        columns = trial_columns(role_by_range)
+        rows = _rows_from_columns(lines, columns, page, ocr, start=0, warnings=[])
+        # Must match _rows_from_columns' own out_cols filter - a role-less column (the trailing
+        # code column here) doesn't get an output cell, so isn't in row.cells at all.
+        out_cols = [c for c in columns if c.role and c.role != "serial"]
+        role_index = {c.role: i for i, c in enumerate(out_cols)}
+        bal_i, deb_i = role_index.get("balance"), role_index.get("debit")
+        cred_i, amt_i = role_index.get("credit"), role_index.get("amount")
+        matches = total = 0
+        prev_bal = None
+        for r in rows[1:]:  # skip the synthetic header row
+            bal = parse_money(r.cells[bal_i]) if bal_i is not None else None
+            bal = bal.signed if bal else None
+            if bal is None:
+                continue
+            if prev_bal is not None:
+                debit = parse_money(r.cells[deb_i]) if deb_i is not None else None
+                credit = parse_money(r.cells[cred_i]) if cred_i is not None else None
+                amount = parse_money(r.cells[amt_i]) if amt_i is not None else None
+                if debit or credit:
+                    total += 1
+                    expected = prev_bal - (debit.value if debit else 0) + (credit.value if credit else 0)
+                    matches += abs(expected - bal) < 1
+                elif amount:
+                    total += 1
+                    matches += abs(abs(bal - prev_bal) - amount.value) < 1
+            prev_bal = bal
+        return (matches / total, total) if total else (0.0, 0)
+
+    best: tuple[float, dict[int, str]] | None = None
+    n = len(num_ranges)
+    for bal_i in range(n):
+        others = [i for i in range(n) if i != bal_i]
+        combos = (
+            [{bal_i: "balance", others[0]: "debit", others[1]: "credit"},
+             {bal_i: "balance", others[1]: "debit", others[0]: "credit"}]
+            if n == 3 else [{bal_i: "balance", others[0]: "amount"}]
+        )
+        for combo in combos:
+            s, total = score(combo)
+            if total >= _MIN_SAMPLES and (best is None or s > best[0]):
+                best = (s, combo)
+
+    if best is None or best[0] < _MIN_RECONCILE_SCORE:
+        return None
+    return trial_columns(best[1])
+
+
+# ----------------------------------------------------------------------------------------------
 # Row extraction
 # ----------------------------------------------------------------------------------------------
 def _date_spans(words: list[Word]) -> list[tuple[int, int]]:
@@ -200,9 +326,18 @@ def _date_spans(words: list[Word]) -> list[tuple[int, int]]:
     return spans
 
 
+_COMPLETE_PAISE = re.compile(r"\.\d{2}$")
+
+
 def _fix_ocr_number(text: str) -> str:
     m = re.match(r"^(.*?)(\s*(?:cr|dr)\.?)?$", text, re.I)
     body, suffix = m.group(1), m.group(2) or ""
+    # A table's vertical ruling line next to the column is often misread as a stray "|"/"l"/"I"
+    # glued onto the very end of the number - if the amount is already complete (ends in two paise
+    # digits) without it, it's noise to drop, not a digit: the confusable-translation below would
+    # otherwise turn it into a spurious extra "1", e.g. "801601.67|" -> "801601.671".
+    if body and body[-1] in "|lI" and _COMPLETE_PAISE.search(body[:-1]):
+        body = body[:-1]
     fixed = body.translate(str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "|": "1", "S": "5", "B": "8"}))
     return fixed + suffix if parse_money(fixed) is not None else text
 
@@ -218,8 +353,21 @@ def layout_page(words: list[Word], page: int, state: LayoutState, ocr: bool = Fa
     elif state.columns:
         columns = state.columns
     else:
-        return []
+        inferred = infer_columns_from_data(lines, page, ocr)
+        if inferred is None:
+            return []
+        columns = state.columns = inferred
+        state.warnings.append(
+            f"page {page}: no header row was found, so columns were inferred from word position "
+            "and running-balance math instead - double-check amounts and Debit/Credit against the "
+            "original statement."
+        )
+    return _rows_from_columns(lines, columns, page, ocr, start, state.warnings)
 
+
+def _rows_from_columns(
+    lines: list[Line], columns: list[Column], page: int, ocr: bool, start: int, warnings: list[str],
+) -> list[RawRow]:
     numeric_cols = [c for c in columns if c.role in NUMERIC_ROLES]
     if not numeric_cols:
         return []
@@ -302,7 +450,7 @@ def layout_page(words: list[Word], page: int, state: LayoutState, ocr: bool = Fa
                 continue
             extra_numeric = [w for w in ws if is_money_like(w.text) and w.x1 >= first_num_x0 - 3 and text_cols]
             if extra_numeric:
-                state.warnings.append(f"page {page}: a line with amounts but no date was skipped: {line.text[:60]!r}")
+                warnings.append(f"page {page}: a line with amounts but no date was skipped: {line.text[:60]!r}")
                 current = None
                 i += 1
                 continue
