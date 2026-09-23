@@ -389,6 +389,9 @@ def _rows_from_columns(
 
     rows: list[RawRow] = [RawRow([LABELS.get(c.role, c.label) for c in out_cols], page)]
     current: list[str] | None = None
+    # Whether the row's own date line already carried narration text of its own (as opposed to
+    # relying entirely on a wrapped prefix/continuation line) - see the note on ``run_end`` below.
+    current_self_narrated = False
     pending_prefix: list[Word] = []
 
     def blank() -> list[str]:
@@ -432,6 +435,7 @@ def _rows_from_columns(
         ws = line.words
         if _FOOTER.search(line.text):
             current = None
+            current_self_narrated = False
             i += 1
             continue
         spans = _date_spans(ws)
@@ -442,25 +446,50 @@ def _rows_from_columns(
             # real bank's layout (Fincare), the *opening* narration of the transaction whose own
             # date+amount line is printed next, with no narration text of its own on that line (the
             # amount line is sandwiched between the narration's start and its wrapped continuation).
-            # A one-line lookahead tells the two apart: if the very next line has a date and would
-            # otherwise contribute no narration, this line belongs to it, not to the row already in
-            # progress.
+            # A lookahead tells the two apart: if a run of one or more such narration-only lines is
+            # immediately followed by a line with a date that would otherwise contribute no
+            # narration, the whole run belongs to it, not to the row already in progress - some
+            # banks wrap that opening narration across two or more lines, not just one. This has to
+            # be checked even when there is no ``current`` row (e.g. right after a stray
+            # amount-without-date line reset it below) - the prefix run belongs to the row that
+            # follows it, not to whatever row happened to come before.
+            extra_numeric = [w for w in ws if is_money_like(w.text) and w.x1 >= first_num_x0 - 3 and text_cols]
+            if extra_numeric:
+                if current is not None:
+                    warnings.append(f"page {page}: a line with amounts but no date was skipped: {line.text[:60]!r}")
+                    current = None
+                    current_self_narrated = False
+                i += 1
+                continue
+            run_end = i
+            while run_end < len(seg):
+                rline = seg[run_end]
+                if _FOOTER.search(rline.text) or find_head_date(rline.words) is not None or _BALANCE_MARKER.match(rline.text):
+                    break
+                if [w for w in rline.words if is_money_like(w.text) and w.x1 >= first_num_x0 - 3 and text_cols]:
+                    break
+                run_end += 1
+            nxt = seg[run_end] if run_end < len(seg) else None
+            if nxt is not None and not _FOOTER.search(nxt.text):
+                nxt_head_date = find_head_date(nxt.words)
+                # Whether the *open* row already has its own narration (not the upcoming one) is
+                # the signal that actually distinguishes "this run is a continuation of the row in
+                # progress" from "this run is the opening of the row that follows": a row whose own
+                # date line already carried narration doesn't need more appended to it, freeing the
+                # run to belong to what comes next - even if that next row's date line *also*
+                # carries some trailing narration of its own (some banks wrap narration around the
+                # date line, split across a prefix run and a same-line tail, not purely before or
+                # after it - checking the upcoming line instead of the current one, as this used
+                # to, gets exactly that case backwards). A row with no narration of its own (relying
+                # entirely on a wrapped prefix or continuation) is still assumed to want this run.
+                if nxt_head_date is not None and (current is None or current_self_narrated):
+                    for rline in seg[i:run_end]:
+                        pending_prefix.extend(rline.words)
+                    i = run_end
+                    continue
             if current is None:
                 i += 1
                 continue
-            extra_numeric = [w for w in ws if is_money_like(w.text) and w.x1 >= first_num_x0 - 3 and text_cols]
-            if extra_numeric:
-                warnings.append(f"page {page}: a line with amounts but no date was skipped: {line.text[:60]!r}")
-                current = None
-                i += 1
-                continue
-            nxt = seg[i + 1] if i + 1 < len(seg) else None
-            if nxt is not None and not _FOOTER.search(nxt.text):
-                nxt_head_date = find_head_date(nxt.words)
-                if nxt_head_date is not None and not has_own_narration(nxt.words):
-                    pending_prefix.extend(ws)
-                    i += 1
-                    continue
             for w in ws:
                 col = _text_column(w, text_cols, narr_col, has_serial)
                 put(current, col, w.text)
@@ -507,10 +536,12 @@ def _rows_from_columns(
                 cells[index_of[id(narr_col)]] = f"{cells[index_of[id(narr_col)]]} {own_text}".strip()
             rows.append(RawRow(cells, page))
             current = None
+            current_self_narrated = False
             i += 1
             continue
         rows.append(RawRow(cells, page))
         current = cells
+        current_self_narrated = head_date is not None and has_own_narration(ws)
         i += 1
     return rows
 

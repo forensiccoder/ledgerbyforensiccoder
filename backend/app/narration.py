@@ -258,6 +258,7 @@ def _decompose(text: str) -> _Parts:
 # ----------------------------------------------------------------------------------------------
 _UPI_WORD = re.compile(r"(?<![A-Z0-9])UPI(?![A-Z0-9])|(?<![A-Z0-9])UPIAR(?![A-Z0-9])", re.I)
 _NEFT_WORD = re.compile(r"(?<![A-Z0-9])NEFT(?![A-Z0-9])", re.I)
+_RTGS_WORD = re.compile(r"(?<![A-Z0-9])RTGS(?![A-Z0-9])", re.I)
 _FEE = re.compile(
     r"\b(?:chg|chgs|chrg|chrgs|charge|charges|fee|fees|commission|comm|gst|cgst|sgst|igst|amc|"
     r"penalty|penal|service\s+tax|min(?:imum)?\s+bal(?:ance)?|non[\s-]?maint\w*|maintenance)\b",
@@ -288,7 +289,7 @@ _REF_LABELLED = re.compile(
 )
 _OTHER_CHANNELS = (
     ("IMPS", re.compile(r"(?<![A-Z0-9])IMPS(?![A-Z0-9])", re.I)),
-    ("RTGS", re.compile(r"(?<![A-Z0-9])RTGS(?![A-Z0-9])", re.I)),
+    ("RTGS", _RTGS_WORD),
     ("ECS/NACH", re.compile(r"\b(?:ECS|NACH|ACH)\b", re.I)),
     ("Cheque", _CHEQUE_OR_CLEARING_WORD),
     ("Card (POS/online)", re.compile(r"\b(?:POS|PCD|ECOM|E-COM)\b", re.I)),
@@ -363,6 +364,15 @@ def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo
         info.confidence = "high" if parts.name and info.reference else "medium"
         if not parts.name:
             info.flags.append("counterparty_not_found")
+        return info
+
+    # 3.5. RTGS - a same-day external bank transfer, not cash. Checked before the cash heuristics
+    # below because banks tag an RTGS row with an urgency/priority code like "URGENT/CASH HIGH"
+    # that would otherwise trip the bare "CASH" fallback in step 5 and misclassify it as a Cash
+    # deposit, the same way NEFT is checked above to keep it out of the cash buckets.
+    if _RTGS_WORD.search(text):
+        info.channel = "RTGS"
+        info.reference = parts.utr or parts.number or parts.rrn or _generic_reference(text)
         return info
 
     # 4. Cash deposit / withdrawal
