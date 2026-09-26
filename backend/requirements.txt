@@ -17,3 +17,4 @@ ocrmypdf>=15.4
 
 # Optional: only needed if you also want XLS (legacy) input support
 # xlrd>=2.0
+opencv-python-headless>=4.9  # scan clean-up (lighting, ruling lines); OCR still runs without it

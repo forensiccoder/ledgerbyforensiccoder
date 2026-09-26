@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import statistics
 from dataclasses import dataclass, field
+from datetime import date
 
 from .headers import LABELS, NUMERIC_ROLES, classify_header, header_ok
 from .models import RawRow
@@ -78,6 +79,7 @@ class LayoutState:
     # the printed cell wrap on top of that, so a printed line break is sometimes *inside* a word
     # ("PAYMEN" / "T FROM PHONE") and sometimes at a space. 0 = not detected; else the chunk width.
     hard_wrap: int = 0
+    last_date: date | None = None  # last valid row date seen (OCR date repair)
     chunk_len: dict = field(default_factory=dict)  # (id(row cells), column) -> length of open chunk
     warnings: list[str] = field(default_factory=list)
     # Which side of a row's date line its wrapped narration lines sit on is a property of the
@@ -171,7 +173,24 @@ def _segment_header(block: list[Line], fuzzy: bool) -> list[Column]:
     for cell in cells:
         ordered = sorted(cell["words"], key=lambda t: (t[0], t[1].x0))
         text = " ".join(w.text for _, w in ordered)
-        columns.append(Column(classify_header(text, fuzzy), text, cell["x0"], cell["x1"]))
+        role = classify_header(text, fuzzy)
+        x0, x1 = cell["x0"], cell["x1"]
+        if role is None and fuzzy and len(ordered) > 1:
+            # OCR often drops a junk fragment ("suai") right beside a real header word, which
+            # spoils the whole cell; look for a header inside it, one or two words at a time.
+            for size in (2, 1):
+                found = next(
+                    ((classify_header(" ".join(w.text for _, w in ordered[k:k + size]), True), ordered[k:k + size])
+                     for k in range(len(ordered) - size + 1)
+                     if classify_header(" ".join(w.text for _, w in ordered[k:k + size]), True)),
+                    None,
+                )
+                if found:
+                    role, sub = found
+                    text = " ".join(w.text for _, w in sub)
+                    x0, x1 = min(w.x0 for _, w in sub), max(w.x1 for _, w in sub)
+                    break
+        columns.append(Column(role, text, x0, x1))
     # A role-less fragment right next to a real header ("Amt." after "Withdrawal") belongs to it.
     merged: list[Column] = []
     for col in columns:
@@ -213,6 +232,7 @@ def find_header(lines: list[Line], fuzzy: bool = False) -> tuple[int, int, list[
 # ----------------------------------------------------------------------------------------------
 _DECIMAL_AMOUNT = re.compile(r"\.\d{1,2}\s*(?:cr|dr)?\.?\s*\|?\s*$", re.I)
 _MIN_SAMPLES = 5
+_MIN_SAMPLES_OCR = 3  # a photographed page often carries only a handful of rows
 _MIN_RECONCILE_SCORE = 0.3
 
 
@@ -230,13 +250,14 @@ def _cluster_by_anchor(items: list[Word], anchor, gap: float) -> list[list[Word]
 
 def infer_columns_from_data(lines: list[Line], page: int, ocr: bool) -> list[Column] | None:
     all_words = [w for line in lines for w in line.words]
+    min_samples = _MIN_SAMPLES_OCR if ocr else _MIN_SAMPLES
     date_words = [w for w in all_words if parse_date(w.text, strict=True)]
-    if len(date_words) < _MIN_SAMPLES:
+    if len(date_words) < min_samples:
         return None
     date_gap = max(20.0, 4 * statistics.median(w.height for w in date_words))
     date_clusters = sorted(_cluster_by_anchor(date_words, lambda w: w.x0, date_gap), key=len, reverse=True)
     date_col_words = date_clusters[0]
-    if len(date_col_words) < _MIN_SAMPLES:
+    if len(date_col_words) < min_samples:
         return None
     date_x0 = min(w.x0 for w in date_col_words)
     date_x1 = max(w.x1 for w in date_col_words)
@@ -246,10 +267,10 @@ def infer_columns_from_data(lines: list[Line], page: int, ocr: bool) -> list[Col
     # column, not an amount - filtering to the decimal form keeps that code column from being
     # mistaken for a fourth money column.
     amount_words = [w for w in all_words if is_money_like(w.text) and _DECIMAL_AMOUNT.search(w.text)]
-    if len(amount_words) < _MIN_SAMPLES:
+    if len(amount_words) < min_samples:
         return None
     amt_gap = max(20.0, 4 * statistics.median(w.height for w in amount_words))
-    num_clusters = [c for c in _cluster_by_anchor(amount_words, lambda w: w.x1, amt_gap) if len(c) >= _MIN_SAMPLES]
+    num_clusters = [c for c in _cluster_by_anchor(amount_words, lambda w: w.x1, amt_gap) if len(c) >= min_samples]
     if len(num_clusters) not in (2, 3):
         return None  # only the (debit, credit, balance) and (amount, balance) shapes are handled
     num_clusters.sort(key=lambda c: min(w.x0 for w in c))
@@ -310,7 +331,13 @@ def infer_columns_from_data(lines: list[Line], page: int, ocr: bool) -> list[Col
 
     best: tuple[float, dict[int, str]] | None = None
     n = len(num_ranges)
-    for bal_i in range(n):
+    # A column whose figures carry a "CR"/"DR" suffix ("7,641.45CR") is the running balance - no
+    # transaction amount is written that way - so do not let a few noisy samples argue otherwise.
+    suffixed = [
+        i for i, c in enumerate(num_clusters)
+        if sum(bool(re.search(r"(?:cr|dr)\.?\W*$", w.text, re.I)) for w in c) >= 0.6 * len(c)
+    ]
+    for bal_i in (suffixed[:1] if suffixed else range(n)):
         others = [i for i in range(n) if i != bal_i]
         combos = (
             [{bal_i: "balance", others[0]: "debit", others[1]: "credit"},
@@ -319,7 +346,7 @@ def infer_columns_from_data(lines: list[Line], page: int, ocr: bool) -> list[Col
         )
         for combo in combos:
             s, total = score(combo)
-            if total >= _MIN_SAMPLES and (best is None or s > best[0]):
+            if total >= min_samples and (best is None or s > best[0]):
                 best = (s, combo)
 
     if best is None or best[0] < _MIN_RECONCILE_SCORE:
@@ -383,13 +410,269 @@ def _fix_ocr_number(text: str) -> str:
     return fixed + suffix if parse_money(fixed) is not None else text
 
 
-def layout_page(words: list[Word], page: int, state: LayoutState, ocr: bool = False) -> list[RawRow]:
+_DATE_SHAPE = re.compile(r"^[|\[(]?(\d{2})[-/.]?(\d{2})[-/.](\d{4})[|\])]?$|^[|\[(]?(\d{2})(\d{2})[-/.](\d{4})[|\])]?$")
+# Digits an OCR engine mistakes for one another in small print.
+_DIGIT_CONFUSION = {"0": "986", "1": "47", "2": "7", "3": "8", "4": "1", "5": "6", "6": "50", "7": "12", "8": "03", "9": "0"}
+
+
+def _repair_ocr_dates(words: list[Word], previous: date | None) -> tuple[list[Word], date | None]:
+    """Fix date-shaped tokens the OCR misread ("46-11-2024" for 16-11-2024, "98-07-2024",
+    "1206-2024"), so their rows are not thrown away as undated.
+
+    A statement's rows run in date order, so of the readings reachable by swapping one or two
+    commonly confused digits, the valid one closest to (and not before) the previous row's date is
+    taken. Only tokens that do not already parse are touched.
+    """
+    import itertools
+
+    ordered = sorted(range(len(words)), key=lambda k: (words[k].top + words[k].bottom) / 2)
+    out = list(words)
+    for k in ordered:
+        w = words[k]
+        if w.x0 > 400 or not _DATE_SHAPE.match(w.text.strip()):
+            continue
+        core = re.sub(r"[|\[\]()]", "", w.text.strip())
+        if parse_date(core, strict=True):
+            previous = parse_date(core, strict=True)
+            continue
+        m = re.match(r"^(\d{2})(\d{2})[-/.](\d{4})$", core)
+        if m:
+            core = f"{m[1]}-{m[2]}-{m[3]}"
+            if parse_date(core, strict=True):
+                out[k] = Word(core, w.x0, w.x1, w.top, w.bottom, w.line_start)
+                previous = parse_date(core, strict=True)
+                continue
+        digits = [i for i, ch in enumerate(core) if ch.isdigit()]
+        best = None
+        for count in (1, 2):
+            for spots in itertools.combinations(digits, count):
+                for repl in itertools.product(*(_DIGIT_CONFUSION.get(core[i], "") for i in spots)):
+                    chars = list(core)
+                    for i, r in zip(spots, repl):
+                        chars[i] = r
+                    candidate = "".join(chars)
+                    parsed = parse_date(candidate, strict=True)
+                    if not parsed:
+                        continue
+                    if previous is not None:
+                        gap = (parsed - previous).days
+                        if gap < 0 or gap > 120:
+                            continue
+                    if best is None or (previous is not None and abs((parsed - previous).days) < abs((best[0] - previous).days)):
+                        best = (parsed, candidate)
+            if best:
+                break
+        if best:
+            out[k] = Word(best[1], w.x0, w.x1, w.top, w.bottom, w.line_start)
+            previous = best[0]
+    return out, previous
+
+
+def _is_ocr_junk(token: str) -> bool:
+    """Scraps OCR invents out of shadows and paper grain: a short run of letters that is neither
+    upper-case (bank codes: WDL, TFR, AT) nor mixed with digits/punctuation (references, names of
+    payees): "ei", "rn.", "vik", "La"."""
+    core = token.strip(".,;:'\"`|()[]{}_-~=<>")
+    if not core:
+        return True
+    if any(ch.isdigit() or ch in "/@&#%" for ch in core):
+        return False
+    return len(core) <= 4 and not core.isupper()
+
+
+def _header_block_end(lines: list[Line]) -> int:
+    """Index just past a run of header-like lines (OCR often reads a column header only partly, so
+    no full header is found, but its words - Debit, Credit, Balance, Description... - still show)."""
+    last = -1
+    for k, line in enumerate(lines[:40]):
+        roles = {classify_header(w.text, True) for w in line.words} - {None}
+        if len(roles) >= 2 and not _date_spans(line.words):
+            last = k
+    return last + 1
+
+
+def page_anchors(words: list[Word]) -> tuple[float, float] | None:
+    """(left, right) x positions that locate a page's table: where the Date column's text starts and
+    where the Balance figures end. Comparing them between pages measures how far a photo's
+    perspective moved the table."""
+    import numpy as np
+
+    if len(words) < 30:
+        return None
+    width = max(w.x1 for w in words)
+    dates = [w for w in words if w.x0 < 0.35 * width and parse_date(w.text, strict=True)]
+    if len(dates) < 3:
+        return None
+    lefts = sorted(w.x0 for w in dates)
+    cluster = [x for x in lefts if x <= lefts[0] + 25]
+    balances = [w.x1 for w in words if w.x0 > 0.45 * width and re.search(r"\d\.\d{2}\s*(?:cr|dr)\.?$", w.text, re.I)]
+    if len(balances) < 3:
+        return None
+    return float(np.median(cluster)), float(np.median(balances))
+
+
+def plan_ocr_columns(pages: list[list[Word]]) -> list[list[Column] | None]:
+    """One column layout for a whole scanned statement, fitted to each page.
+
+    Per-page header reading and per-page inference are both unreliable on photographed pages (a
+    header printed on a grey band comes back as fragments; a page with three rows cannot tell a
+    Debit column from a Balance column). The columns are the same on every page, though, so take
+    the best evidence anywhere - a header read in full, else the most convincing inference - and
+    move it onto each page by the left/right anchors, which follow the photo's perspective.
+    """
+    prepared: list[list[Word]] = []
+    state_date: date | None = None
+    for words in pages:
+        fixed, state_date = _repair_ocr_dates(words, state_date)
+        prepared.append(_dewarp(fixed))
+    best: tuple[int, list[Column], tuple[float, float]] | None = None
+    for words in prepared:
+        anchors = page_anchors(words)
+        if anchors is None:
+            continue
+        lines = group_lines(words)
+        found = find_header(lines, fuzzy=True)
+        cols = found[2] if found else None
+        score = len({c.role for c in cols if c.role}) if cols else 0
+        if not cols or not {"date", "narration", "balance"} <= {c.role for c in cols} or not {"debit", "credit"} & {c.role for c in cols}:
+            inferred = infer_columns_from_data(lines, 0, True)
+            if inferred and {"debit", "credit", "balance"} <= {c.role for c in inferred}:
+                cols, score = inferred, max(score, 5)
+            elif not cols:
+                continue
+        if best is None or score > best[0]:
+            best = (score, cols, anchors)
+    if best is None:
+        return [None] * len(pages)
+    _, template, (tl, tr) = best
+    out: list[list[Column] | None] = []
+    for words in prepared:
+        anchors = page_anchors(words)
+        if anchors is None or tr - tl < 100:
+            out.append(None)
+            continue
+        pl, pr = anchors
+        scale = (pr - pl) / (tr - tl)
+        out.append([Column(c.role, c.label, pl + (c.x0 - tl) * scale, pl + (c.x1 - tl) * scale) for c in template])
+    return out
+
+
+def _dewarp(words: list[Word]) -> list[Word]:
+    """Straighten the vertical drift of a photographed table.
+
+    A phone photo of a page is rarely flat: the right-hand columns sit higher or lower than the
+    Date column beside them, and by an amount that itself changes down the page (+5pt near the top,
+    -8pt near the bottom on one real scan) - more than the tolerance for calling two words the same
+    line, so amounts land between rows and get dropped. The dates and the money figures of a row
+    are the same row, so their measured vertical offsets say how far each column has drifted; fit
+    that as ``offset = fraction_of_the_way_across * (c0 + c1 * y)`` and take it back out.
+    Returns the words unchanged unless there is a clear, consistent drift to correct.
+    """
+    import numpy as np
+
+    if len(words) < 30:
+        return words
+    width = max(w.x1 for w in words)
+    date_words = [w for w in words if w.x0 < 0.35 * width and parse_date(w.text, strict=True)]
+    if len(date_words) < 4:
+        return words
+    # One anchor per row: the Post Date and the Value Date of a row share a line, and either may be
+    # the only one the OCR managed to read.
+    raw_ys = sorted((w.top + w.bottom) / 2 for w in date_words)
+    date_ys = []
+    group = [raw_ys[0]]
+    for y in raw_ys[1:]:
+        if y - group[-1] <= 6:
+            group.append(y)
+        else:
+            date_ys.append(sum(group) / len(group))
+            group = [y]
+    date_ys.append(sum(group) / len(group))
+    if len(date_ys) < 4:
+        return words
+    spacing = float(np.median(np.diff(date_ys)))
+    if spacing < 14:
+        return words  # rows too tight to tell drift from a neighbouring row
+    date_x = float(np.mean([(w.x0 + w.x1) / 2 for w in date_words]))
+    amounts = [w for w in words if w.x0 > 0.45 * width and is_money_like(w.text) and "." in w.text]
+    if len(amounts) < 4:
+        return words
+    ref_x = float(np.median([(w.x0 + w.x1) / 2 for w in amounts if re.search(r"(?:cr|dr)$", w.text, re.I)] or [max((w.x0 + w.x1) / 2 for w in amounts)]))
+    if ref_x <= date_x + 50:
+        return words
+
+    def fraction(w: Word) -> float:
+        return min(1.0, max(0.0, ((w.x0 + w.x1) / 2 - date_x) / (ref_x - date_x)))
+
+    samples: list[tuple[float, float, float]] = []  # (y_date, dy / fraction, weight)
+    for w in amounts:
+        y = (w.top + w.bottom) / 2
+        nearest = min(date_ys, key=lambda dy: abs(dy - y))
+        if abs(nearest - y) <= 0.45 * spacing and fraction(w) > 0.5:
+            samples.append((nearest, (y - nearest) / fraction(w), 1.0))
+    if len(samples) < 4:
+        return words
+    ys = np.array([s[0] for s in samples])
+    off = np.array([s[1] for s in samples])
+    keep = np.ones(len(ys), bool)
+    coeffs = np.array([float(np.median(off)), 0.0])
+    for _ in range(4):
+        if keep.sum() < 4:
+            return words
+        coeffs = np.polyfit(ys[keep], off[keep], 1)[::-1]  # c0, c1
+        residual = np.abs(off - (coeffs[0] + coeffs[1] * ys))
+        keep = residual <= max(2.0, 2.5 * float(np.median(residual[keep])))
+    fitted = coeffs[0] + coeffs[1] * ys
+    if float(np.max(np.abs(fitted))) < 2.5:
+        return words  # no meaningful drift
+    if float(np.median(np.abs(off - fitted))) > 0.25 * spacing:
+        return words  # the model does not describe this page well; leave it alone
+    # The straight-line fit gets close, but a curled page drifts a little differently from row to
+    # row; refine it with each row's own measured offset (the inliers), interpolated in between.
+    inlier_ys, inlier_off = ys[keep], off[keep]
+    anchors: dict[float, list[float]] = {}
+    for y, o in zip(inlier_ys, inlier_off):
+        anchors.setdefault(float(y), []).append(float(o))
+    anchor_y = np.array(sorted(anchors))
+    anchor_off = np.array([float(np.median(anchors[y])) for y in anchor_y])
+
+    def drift(y: float) -> float:
+        if len(anchor_y) >= 5:
+            return float(np.interp(y, anchor_y, anchor_off))
+        return float(coeffs[0] + coeffs[1] * y)
+
+    out = []
+    for w in words:
+        y = (w.top + w.bottom) / 2
+        shift = fraction(w) * drift(y)
+        if is_money_like(w.text) and "." in w.text and w.x0 > 0.45 * width:
+            # A money figure is on its row's line by definition: snap what is left of the drift.
+            nearest = min(date_ys, key=lambda dy: abs(dy - (y - shift)))
+            if abs(nearest - (y - shift)) <= 0.4 * spacing:
+                shift = y - nearest
+        out.append(Word(w.text, w.x0, w.x1, w.top - shift, w.bottom - shift))
+    return out
+
+
+def layout_page(
+    words: list[Word], page: int, state: LayoutState, ocr: bool = False,
+    columns_override: list[Column] | None = None,
+) -> list[RawRow]:
+    if ocr:
+        words, state.last_date = _repair_ocr_dates(words, state.last_date)
+        words = _dewarp(words)
     lines = group_lines(words)
     if not state.hard_wrap and not ocr:
         state.hard_wrap = _detect_hard_wrap(lines)
     found = find_header(lines, fuzzy=ocr)
     start = 0
-    if found:
+    if columns_override:
+        columns = state.columns = columns_override
+        if found:
+            start = found[1] + 1
+        else:
+            start = _header_block_end(lines)
+    elif found:
         hi, hj, columns = found
         state.columns = columns
         start = hj + 1
@@ -465,8 +748,8 @@ def _rows_from_columns(
         """A money-shaped word in the numeric area. A bare integer that only *reaches* into it (a
         right-aligned reference number wider than its header, e.g. "308067" under "Chq./Ref.No.")
         is not an amount: real amounts carry decimals/separators or start inside the numeric area."""
-        if not is_money_like(w.text) or w.x1 < first_num_x0 - 3:
-            return False
+        if not is_money_like(w.text) or w.x1 < first_num_x0 - 3 or re.fullmatch(r"\d{10,}", w.text):
+            return False  # (a bare 10+ digit run is a reference/account number, never an amount)
         return "." in w.text or "," in w.text or w.x0 >= first_num_x0 - 3
 
     def blank() -> list[str]:
@@ -476,6 +759,8 @@ def _rows_from_columns(
         if col is None or id(col) not in index_of:
             return
         k = index_of[id(col)]
+        if ocr and col is narr_col and _is_ocr_junk(text):
+            return
         if state.hard_wrap and col is narr_col and cells[k]:
             key = (id(cells), k)
             used_len = state.chunk_len.get(key, len(cells[k]))
@@ -493,6 +778,20 @@ def _rows_from_columns(
 
     def find_head_date(ws: list[Word]) -> tuple[int, int] | None:
         spans = _date_spans(ws)
+        head = next_head(ws, spans)
+        if head is None and ocr and value_date_col is not None and date_col is not None:
+            # The Post Date was unreadable but the Value Date beside it was not: still a row.
+            head = next(
+                (
+                    s for s in spans
+                    if s[0] <= 1 and ws[s[0]].x0 < first_num_x0
+                    and min(_left_cols, key=lambda c: abs(ws[s[0]].x0 - c.x0)) is value_date_col
+                ),
+                None,
+            )
+        return head
+
+    def next_head(ws: list[Word], spans: list[tuple[int, int]]) -> tuple[int, int] | None:
         return next(
             (
                 s for s in spans
@@ -546,6 +845,22 @@ def _rows_from_columns(
             state.continuation_votes += 1
             return False
         return prefix_mode()
+
+    def split_point(run: list[Line], nxt: Line) -> int | None:
+        """A run between two dated lines can hold the tail of the open row *and* the head of the
+        next one (a cell whose text is centred on the date line: a label above it, the rest below).
+        The row boundary then shows as one clearly larger vertical gap strictly inside the run, while
+        the lines of one row are set at an even pitch. Returns how many leading lines belong to the
+        open row, or None when there is no such clear boundary."""
+        if current is None or len(run) < 2 or not has_own_narration(nxt.words):
+            return None
+        gaps = [run[0].mid - current_mid] + [b.mid - a.mid for a, b in zip(run, run[1:])] + [nxt.mid - run[-1].mid]
+        widest = max(range(len(gaps)), key=lambda g: gaps[g])
+        if widest in (0, len(gaps) - 1):
+            return None
+        rest = sorted(g for k, g in enumerate(gaps) if k != widest)
+        typical = rest[len(rest) // 2]
+        return widest if typical > 0 and gaps[widest] >= 1.4 * typical else None
 
     seg = lines[start:]
     i = 0
@@ -605,6 +920,16 @@ def _rows_from_columns(
             nxt = seg[run_end] if run_end < len(seg) else None
             run = seg[i:run_end]
             if nxt is not None and not _FOOTER.search(nxt.text) and find_head_date(nxt.words) is not None:
+                cut = split_point(run, nxt)
+                if cut:
+                    for rline in run[:cut]:
+                        for w in rline.words:
+                            put(current, _text_column(w, text_cols, narr_col, has_serial), w.text, w.line_start)
+                        current_mid = rline.mid
+                    for rline in run[cut:]:
+                        pending_prefix.extend(rline.words)
+                    i = run_end
+                    continue
                 if run_belongs_to_next(run, nxt):
                     for rline in run:
                         pending_prefix.extend(rline.words)

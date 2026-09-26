@@ -14,7 +14,7 @@ import pdfplumber
 
 from .errors import StatementError, password_required, wrong_password
 from .headers import is_header_row
-from .layout import _FOOTER, LayoutState, Word, layout_page
+from .layout import _FOOTER, LayoutState, Word, layout_page, plan_ocr_columns
 from .models import ExtractResult, RawRow
 from .money import parse_date, parse_money
 from .ocr import ocr_words
@@ -158,6 +158,7 @@ def extract_pdf(data: bytes, password: str | None = None, ocr_mode: str = "auto"
     """``ocr_mode``: "auto" (OCR only pages with no text layer), "force", or "off"."""
     state = LayoutState()
     rows: list[RawRow] = []
+    deferred: list[tuple[int, int, list[Word]]] = []  # (insert position, page, OCR words)
     methods: set[str] = set()
     ocr_pages: list[int] = []
     warnings: list[str] = []
@@ -172,7 +173,8 @@ def extract_pdf(data: bytes, password: str | None = None, ocr_mode: str = "auto"
                 has_text = len(page.chars) >= MIN_TEXT_CHARS
                 if ocr_mode == "force" or (ocr_mode == "auto" and not has_text):
                     words, conf = ocr_words(page)
-                    rows.extend(layout_page(words, page_no, state, ocr=True))
+                    # Laid out after the whole document has been read (see plan_ocr_columns).
+                    deferred.append((len(rows), page_no, words))
                     methods.add("ocr")
                     ocr_pages.append(page_no)
                     if conf < 70:
@@ -192,5 +194,13 @@ def extract_pdf(data: bytes, password: str | None = None, ocr_mode: str = "auto"
                         methods.add("pdf-text")
             finally:
                 page.flush_cache()
+    if deferred:
+        plans = plan_ocr_columns([words for _, _, words in deferred])
+        results: list[list[RawRow]] = []
+        for (position, page_no, words), columns in zip(deferred, plans):
+            results.append(layout_page(words, page_no, state, ocr=True, columns_override=columns))
+        # Spliced back-to-front so earlier insert positions stay valid.
+        for (position, _, _), page_rows in reversed(list(zip(deferred, results))):
+            rows[position:position] = page_rows
     warnings.extend(state.warnings[:10])
     return ExtractResult(rows, "+".join(sorted(methods)) or "pdf-text", total, ocr_pages, warnings)
