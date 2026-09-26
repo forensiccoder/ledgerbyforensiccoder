@@ -101,15 +101,30 @@ export default function Home() {
   const [status, setStatus] = useState<"idle" | "processing" | "ready" | "error">("idle");
   const [message, setMessage] = useState("");
   const [activeCategory, setActiveCategory] = useState<Category | "All">("All");
+  const [activeCounterparty, setActiveCounterparty] = useState("All");
   const [search, setSearch] = useState("");
   const [dragging, setDragging] = useState(false);
 
   const targetTransactions = useMemo(() => transactions.filter((transaction) => TARGET_CATEGORIES.includes(transaction.category)), [transactions]);
+  // "Cash deposit" / "Cash withdrawal" / "Review narration" are display_counterparty()'s own
+  // fallback labels for a transaction with no counterparty the narration parser could identify -
+  // listing those as if they were real counterparty names would be misleading.
+  const counterpartyOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const transaction of targetTransactions) {
+      const name = transaction.beneficiary;
+      if (name === "Cash deposit" || name === "Cash withdrawal" || name === "Review narration") continue;
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    return [...counts.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [targetTransactions]);
+
   const filtered = useMemo(() => targetTransactions.filter((transaction) => {
     const categoryMatches = activeCategory === "All" || transaction.category === activeCategory;
+    const counterpartyMatches = activeCounterparty === "All" || transaction.beneficiary === activeCounterparty;
     const searchText = `${transaction.beneficiary} ${transaction.narration} ${transaction.reference}`.toLowerCase();
-    return categoryMatches && searchText.includes(search.trim().toLowerCase());
-  }).sort((a, b) => b.dateIso.localeCompare(a.dateIso)), [targetTransactions, activeCategory, search]);
+    return categoryMatches && counterpartyMatches && searchText.includes(search.trim().toLowerCase());
+  }).sort((a, b) => b.dateIso.localeCompare(a.dateIso)), [targetTransactions, activeCategory, activeCounterparty, search]);
 
   const totals = useMemo(() => TARGET_CATEGORIES.map((category) => {
     const matches = targetTransactions.filter((transaction) => transaction.category === category);
@@ -194,6 +209,19 @@ export default function Home() {
 
         <div className="summary-grid">
           {totals.map((total) => <button key={total.category} className={`summary-card ${categoryClass[total.category]} ${activeCategory === total.category ? "active" : ""}`} onClick={() => setActiveCategory(activeCategory === total.category ? "All" : total.category)} type="button"><span>{total.category}</span><strong>{total.count.toLocaleString("en-IN")}</strong><small>{formatAmount(total.amount)}</small></button>)}
+          <div className={`summary-card counterparty ${activeCounterparty !== "All" ? "active" : ""}`}>
+            <span>Counterparty</span>
+            <select
+              value={activeCounterparty}
+              onChange={(event) => setActiveCounterparty(event.target.value)}
+              disabled={!counterpartyOptions.length}
+              aria-label="Filter by counterparty"
+            >
+              <option value="All">All counterparties</option>
+              {counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}
+            </select>
+            <small>{counterpartyOptions.length ? `${counterpartyOptions.length} identified` : "Upload a statement"}</small>
+          </div>
         </div>
 
         <div className="table-card">
