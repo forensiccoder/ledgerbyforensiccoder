@@ -300,6 +300,10 @@ _FEE = re.compile(
     r"penalty|penal|service\s+tax|min(?:imum)?\s+bal(?:ance)?|non[\s-]?maint\w*|maintenance)\b",
     re.I,
 )
+# Charges levied for handling cash ("BRN CASH TXN CHGS INCL GST ...", "INTER-BRN CASH CHG ...") carry
+# a bank reference number, so the strong-reference guard below would otherwise let them through
+# as cash movements.
+_CASH_CHARGE = re.compile(r"\bcash\b.*\b(?:chg|chgs|chrg|chrgs|charges?)\b|\b(?:chg|chgs|chrg|chrgs|charges?)\b.*\bcash\b", re.I)
 _CASH_DEP = re.compile(
     r"\b(?:cash\s*[-/.]?\s*(?:dep(?:osit(?:ed)?)?|cr(?:edit)?|received|rcvd|in)|csh\s*[-/.]?\s*dep\w*|"
     r"by\s+cash|cdm|bna)\b",
@@ -374,7 +378,7 @@ def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo
     # 1. Bank fees named after the product ("NEFT CHARGES", "ATM ANNUAL FEE") are not transfers or
     #    cash movements. A real UPI/NEFT transfer always carries an RRN/VPA/UTR/IFSC, so require
     #    that to be absent before calling it a fee (a UPI remark like "GST payment" stays UPI).
-    if _FEE.search(text) and not strong_ref:
+    if _FEE.search(text) and (not strong_ref or (_CASH_CHARGE.search(text) and not _UPI_WORD.search(text))):
         info.channel = "Charges"
         info.reference = _generic_reference(text)
         return info

@@ -30,3 +30,12 @@ def test_wthdrl_with_clearing_reference_is_not_cash_withdrawal():
     info = parse_narration("WTHDRL,CLG/000006/JOHN DOE", direction="Debit")
     assert info.category != "Cash withdrawal"
     assert info.channel == "Cheque"
+
+
+def test_cash_handling_charges_are_fees_not_cash_withdrawals():
+    from app.narration import parse_narration
+
+    for text in ("BRN CASH TXN CHGS INCL GST 260825-MIR2626408043201", "INTER-BRN CASH CHG INCL GST 20-08-25 MIR2625261083355"):
+        info = parse_narration(text, direction="Debit")
+        assert info.category != "Cash withdrawal", text
+        assert info.channel == "Charges", text

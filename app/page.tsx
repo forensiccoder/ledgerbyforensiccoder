@@ -109,6 +109,11 @@ export default function Home() {
   const [activeCategory, setActiveCategory] = useState<Category | "All">("All");
   const [activeCounterparty, setActiveCounterparty] = useState("All");
   const [search, setSearch] = useState("");
+  // Materiality: keep only transactions at/above ("above") or at/below ("below") an amount.
+  const [materialityMode, setMaterialityMode] = useState<"above" | "below">("above");
+  const [materialityInput, setMaterialityInput] = useState("");
+  const [materialityOpen, setMaterialityOpen] = useState(false);
+  const materialityAmount = (() => { const value = Number(materialityInput.replace(/[,\s₹]/g, "")); return materialityInput.trim() !== "" && Number.isFinite(value) && value >= 0 ? value : null; })();
   const [dragging, setDragging] = useState(false);
 
   // Switching category clears any counterparty drill-down from before - otherwise the two filters
@@ -134,8 +139,9 @@ export default function Home() {
     const categoryMatches = activeCategory === "All" || transaction.category === activeCategory;
     const counterpartyMatches = activeCounterparty === "All" || transaction.beneficiary === activeCounterparty;
     const searchText = `${transaction.beneficiary} ${transaction.narration} ${transaction.reference}`.toLowerCase();
-    return categoryMatches && counterpartyMatches && searchText.includes(search.trim().toLowerCase());
-  }).sort((a, b) => a.dateIso.localeCompare(b.dateIso)), [targetTransactions, activeCategory, activeCounterparty, search]);
+    const materialityMatches = materialityAmount === null || (materialityMode === "above" ? transaction.amount >= materialityAmount : transaction.amount <= materialityAmount);
+    return categoryMatches && counterpartyMatches && materialityMatches && searchText.includes(search.trim().toLowerCase());
+  }).sort((a, b) => a.dateIso.localeCompare(b.dateIso)), [targetTransactions, activeCategory, activeCounterparty, search, materialityMode, materialityAmount]);
 
   // Net, not gross: a category like NEFT or UPI can hold both incoming and outgoing transactions,
   // so summing every amount as positive would overstate what actually moved. Cash deposit/
@@ -155,7 +161,7 @@ export default function Home() {
       // A filter left over from a previously loaded statement (a category, a counterparty, a
       // search term) can silently hide everything in a new one if it doesn't happen to match -
       // start every newly loaded statement with a clean, unfiltered view.
-      setActiveCategory("All"); setActiveCounterparty("All"); setSearch("");
+      setActiveCategory("All"); setActiveCounterparty("All"); setSearch(""); setMaterialityInput(""); setMaterialityOpen(false);
       setStatus("ready");
       const detected = parsed.transactions.length;
       setMessage(`${detected} target transactions detected from ${parsed.totalRows} statement rows. ${parsed.unclassified ? `${parsed.unclassified} non-target rows were kept out of the review list.` : ""}`);
@@ -233,7 +239,7 @@ export default function Home() {
         <div className="table-card">
           <div className="table-toolbar">
             <div><span className="section-kicker">Categorised activity</span><h3>{fileName ? fileName : "Upload a statement to begin"}</h3></div>
-            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label><select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><button className="button export" type="button" onClick={() => void exportWorkbook()} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
+            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label><select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><div className="materiality"><button className={`button materiality-toggle ${materialityAmount !== null ? "active" : ""}`} type="button" onClick={() => setMaterialityOpen((open) => !open)} aria-expanded={materialityOpen} aria-haspopup="dialog" disabled={!targetTransactions.length}>Materiality{materialityAmount !== null ? `: ${materialityMode === "above" ? "≥" : "≤"} ${formatAmount(materialityAmount)}` : ""}</button>{materialityOpen && <div className="materiality-panel" role="dialog" aria-label="Materiality filter"><label>Show transactions<select value={materialityMode} onChange={(event) => setMaterialityMode(event.target.value as "above" | "below")}><option value="above">at or above</option><option value="below">at or below</option></select></label><label>Amount (₹)<input inputMode="decimal" value={materialityInput} onChange={(event) => setMaterialityInput(event.target.value)} placeholder="e.g. 50000" autoFocus /></label><div className="materiality-actions"><button className="button" type="button" onClick={() => setMaterialityInput("")} disabled={!materialityInput}>Clear</button><button className="button button-dark" type="button" onClick={() => setMaterialityOpen(false)}>Done</button></div></div>}</div><button className="button export" type="button" onClick={() => void exportWorkbook()} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
           </div>
           <div className="filters" aria-label="Transaction category filters"><button className={activeCategory === "All" ? "selected" : ""} onClick={() => selectCategory("All")} type="button">All detected <b>{targetTransactions.length}</b></button>{totals.map((total) => <button key={total.category} className={activeCategory === total.category ? "selected" : ""} onClick={() => selectCategory(total.category)} type="button">{total.category} <b>{total.count}</b></button>)}</div>
           <div className="table-wrap">
