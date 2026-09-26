@@ -93,6 +93,10 @@ async function analyzeFile(file: File, password?: string): Promise<ParsedFile> {
 }
 
 function formatAmount(amount: number) { return numberFormatter.format(amount); }
+// Amounts are stored as absolute values (see backend Money model) with direction tracked
+// separately, so the sign shown here is derived, not part of the number itself.
+function directionClass(direction: Direction) { return direction === "Debit" ? "debit" : direction === "Credit" ? "credit" : ""; }
+function signedAmount(direction: Direction, amount: number) { return `${direction === "Debit" ? "−" : direction === "Credit" ? "+" : ""}${formatAmount(amount)}`; }
 
 export default function Home() {
   const fileInput = useRef<HTMLInputElement>(null);
@@ -240,7 +244,7 @@ export default function Home() {
           </div>
           <div className="filters" aria-label="Transaction category filters"><button className={activeCategory === "All" ? "selected" : ""} onClick={() => selectCategory("All")} type="button">All detected <b>{targetTransactions.length}</b></button>{totals.map((total) => <button key={total.category} className={activeCategory === total.category ? "selected" : ""} onClick={() => selectCategory(total.category)} type="button">{total.category} <b>{total.count}</b></button>)}</div>
           <div className="table-wrap">
-            {filtered.length ? <table><thead><tr><th>Transaction date</th><th>Category</th><th>Beneficiary / payer</th><th>Reference</th><th>Narration</th><th className="amount">Amount</th></tr></thead><tbody>{filtered.map((transaction) => <tr key={transaction.id}><td className="date-cell">{transaction.date}<small>{transaction.direction}</small></td><td><span className={`tag ${categoryClass[transaction.category]}`}>{transaction.category}</span></td><td className="beneficiary">{transaction.beneficiary}</td><td className="reference">{transaction.reference}</td><td className="narration">{transaction.narration}</td><td className="amount">{formatAmount(transaction.amount)}</td></tr>)}</tbody></table> : <div className="empty-state"><div>⌁</div><strong>{status === "ready" ? "No matching activity" : "Your forensic review starts here"}</strong><p>{status === "ready" ? "Try another category or search phrase." : "Upload a statement to extract cash deposits, cash withdrawals, NEFT and UPI transactions."}</p></div>}
+            {filtered.length ? <table><thead><tr><th>Transaction date</th><th>Category</th><th>Beneficiary / payer</th><th>Reference</th><th>Narration</th><th className="amount">Amount</th></tr></thead><tbody>{filtered.map((transaction) => <tr key={transaction.id}><td className="date-cell">{transaction.date}<small className={directionClass(transaction.direction)}>{transaction.direction}</small></td><td><span className={`tag ${categoryClass[transaction.category]}`}>{transaction.category}</span></td><td className="beneficiary">{transaction.beneficiary}</td><td className="reference">{transaction.reference}</td><td className="narration">{transaction.narration}</td><td className={`amount ${directionClass(transaction.direction)}`}>{signedAmount(transaction.direction, transaction.amount)}</td></tr>)}</tbody></table> : <div className="empty-state"><div>⌁</div><strong>{status === "ready" ? "No matching activity" : "Your forensic review starts here"}</strong><p>{status === "ready" ? "Try another category or search phrase." : "Upload a statement to extract cash deposits, cash withdrawals, NEFT and UPI transactions."}</p></div>}
           </div>
           <footer className="table-footer"><span>{targetTransactions.length ? `${filtered.length} of ${targetTransactions.length} detected transactions shown` : "No statement loaded"}</span><span>Review beneficiary inference against the original narration before relying on it.</span></footer>
         </div>
