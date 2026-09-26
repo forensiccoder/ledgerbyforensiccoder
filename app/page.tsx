@@ -97,6 +97,7 @@ function formatAmount(amount: number) { return numberFormatter.format(amount); }
 // separately, so the sign shown here is derived, not part of the number itself.
 function directionClass(direction: Direction) { return direction === "Debit" ? "debit" : direction === "Credit" ? "credit" : ""; }
 function signedAmount(direction: Direction, amount: number) { return `${direction === "Debit" ? "−" : direction === "Credit" ? "+" : ""}${formatAmount(amount)}`; }
+function formatNet(amount: number) { return `${amount < 0 ? "−" : "+"}${formatAmount(Math.abs(amount))}`; }
 
 export default function Home() {
   const fileInput = useRef<HTMLInputElement>(null);
@@ -135,9 +136,13 @@ export default function Home() {
     return categoryMatches && counterpartyMatches && searchText.includes(search.trim().toLowerCase());
   }).sort((a, b) => b.dateIso.localeCompare(a.dateIso)), [targetTransactions, activeCategory, activeCounterparty, search]);
 
+  // Net, not gross: a category like NEFT or UPI can hold both incoming and outgoing transactions,
+  // so summing every amount as positive would overstate what actually moved. Cash deposit/
+  // withdrawal are effectively one-directional already, so this only changes NEFT/UPI in practice.
   const totals = useMemo(() => TARGET_CATEGORIES.map((category) => {
     const matches = targetTransactions.filter((transaction) => transaction.category === category);
-    return { category, count: matches.length, amount: matches.reduce((sum, transaction) => sum + transaction.amount, 0) };
+    const net = matches.reduce((sum, transaction) => sum + (transaction.direction === "Debit" ? -transaction.amount : transaction.amount), 0);
+    return { category, count: matches.length, amount: net };
   }), [targetTransactions]);
 
   const handleUpload = async (file?: File, password?: string) => {
@@ -181,7 +186,7 @@ export default function Home() {
       "Statement narration": transaction.narration,
       "Source file": transaction.source,
     }));
-    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(totals.map((total) => ({ Category: total.category, Transactions: total.count, "Total amount (INR)": total.amount }))), "Summary");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(totals.map((total) => ({ Category: total.category, Transactions: total.count, "Net amount (INR)": total.amount }))), "Summary");
     TARGET_CATEGORIES.forEach((category) => {
       const sheet = XLSX.utils.json_to_sheet(rowsFor(targetTransactions.filter((transaction) => transaction.category === category)));
       XLSX.utils.book_append_sheet(workbook, sheet, category.replace(" ", " ").slice(0, 31));
@@ -221,7 +226,7 @@ export default function Home() {
         <div className={`privacy-line ${status === "error" ? "error" : ""}`}><span>{status === "error" ? "!" : "✓"}</span>{message || "Statements are sent to the LedgerLens analysis service for extraction. Scanned PDFs are OCR'd automatically."}</div>
 
         <div className="summary-grid">
-          {totals.map((total) => <button key={total.category} className={`summary-card ${categoryClass[total.category]} ${activeCategory === total.category ? "active" : ""}`} onClick={() => selectCategory(activeCategory === total.category ? "All" : total.category)} type="button"><span>{total.category}</span><strong>{total.count.toLocaleString("en-IN")}</strong><small>{formatAmount(total.amount)}</small></button>)}
+          {totals.map((total) => <button key={total.category} className={`summary-card ${categoryClass[total.category]} ${activeCategory === total.category ? "active" : ""}`} onClick={() => selectCategory(activeCategory === total.category ? "All" : total.category)} type="button"><span>{total.category}</span><strong>{total.count.toLocaleString("en-IN")}</strong><small className={total.amount < 0 ? "debit" : "credit"}>{formatNet(total.amount)} net</small></button>)}
           <div className={`summary-card counterparty ${activeCounterparty !== "All" ? "active" : ""}`}>
             <span>Counterparty</span>
             <select
