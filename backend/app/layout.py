@@ -74,6 +74,16 @@ class LayoutState:
     table_header_cells: list[str] | None = None
     table_col_ranges: list[tuple[float, float] | None] | None = None
     warnings: list[str] = field(default_factory=list)
+    # Which side of a row's date line its wrapped narration lines sit on is a property of the
+    # statement's layout, not of any one row: text-only statements print continuation lines *below*
+    # the date line, while bordered tables with bottom-aligned cells (common in scans) print them
+    # *above* it. Each row where the spacing makes it unambiguous casts a vote, and the tally
+    # settles the rows where it doesn't (see ``_rows_from_columns``).
+    prefix_votes: int = 0
+    continuation_votes: int = 0
+    # The last row built on the previous page, so a narration that spills onto the next page can be
+    # rejoined to it instead of being mistaken for the start of the next page's first row.
+    last_row: list[str] | None = None
 
 
 _FOOTER = re.compile(
@@ -260,7 +270,7 @@ def infer_columns_from_data(lines: list[Line], page: int, ocr: bool) -> list[Col
 
     def score(role_by_range: dict[int, str]) -> tuple[float, int]:
         columns = trial_columns(role_by_range)
-        rows = _rows_from_columns(lines, columns, page, ocr, start=0, warnings=[])
+        rows = _rows_from_columns(lines, columns, page, ocr, start=0, state=LayoutState())
         # Must match _rows_from_columns' own out_cols filter - a role-less column (the trailing
         # code column here) doesn't get an output cell, so isn't in row.cells at all.
         out_cols = [c for c in columns if c.role and c.role != "serial"]
@@ -383,11 +393,11 @@ def layout_page(words: list[Word], page: int, state: LayoutState, ocr: bool = Fa
             "and running-balance math instead - double-check amounts and Debit/Credit against the "
             "original statement."
         )
-    return _rows_from_columns(lines, columns, page, ocr, start, state.warnings)
+    return _rows_from_columns(lines, columns, page, ocr, start, state)
 
 
 def _rows_from_columns(
-    lines: list[Line], columns: list[Column], page: int, ocr: bool, start: int, warnings: list[str],
+    lines: list[Line], columns: list[Column], page: int, ocr: bool, start: int, state: LayoutState,
 ) -> list[RawRow]:
     numeric_cols = [c for c in columns if c.role in NUMERIC_ROLES]
     if not numeric_cols:
@@ -416,6 +426,9 @@ def _rows_from_columns(
     # Whether the row's own date line already carried a Debit/Credit/Balance value of its own -
     # see the note on ``extra_numeric`` below.
     current_has_numbers = False
+    # Vertical position of the last line attributed to the open row, for the spacing test in
+    # ``run_belongs_to_next``.
+    current_mid = 0.0
     pending_prefix: list[Word] = []
 
     def blank() -> list[str]:
@@ -451,6 +464,37 @@ def _rows_from_columns(
         for s in _date_spans(ws):
             used.update(range(s[0], s[1] + 1))
         return any(idx not in used and not is_money_like(w.text) for idx, w in enumerate(ws))
+
+    def prefix_mode() -> bool:
+        return state.prefix_votes > state.continuation_votes
+
+    def run_belongs_to_next(run: list[Line], nxt: Line) -> bool:
+        """Do these narration-only lines, sitting between the open row and the next dated line,
+        belong to the row that follows them rather than the one above?
+
+        Statements differ in which side of the date line a wrapped narration sits on - continuation
+        lines *below* it (text statements) or lines *above* it (bottom-aligned cells, common in
+        scans) - and a wrong guess silently attaches text to the wrong transaction. Cheapest tell:
+        spacing. Lines belonging together are set closer than lines belonging to different rows, so
+        whichever dated line the run is clearly nearer to is its owner. When the spacing is uniform
+        there is no such tell (a plain text statement), and the run follows the document's own
+        convention as voted so far - defaulting to the common one, continuation below.
+        """
+        if not has_own_narration(nxt.words):
+            return True  # its own line carries none, so what it has must come from the run
+        if current is None:
+            return prefix_mode()
+        if not current_self_narrated:
+            return False  # the open row is still short of narration; the run is its continuation
+        gap_before = run[0].mid - current_mid
+        gap_after = nxt.mid - run[-1].mid
+        if gap_after < 0.75 * gap_before:
+            state.prefix_votes += 1
+            return True
+        if gap_before < 0.75 * gap_after:
+            state.continuation_votes += 1
+            return False
+        return prefix_mode()
 
     seg = lines[start:]
     i = 0
@@ -493,7 +537,7 @@ def _rows_from_columns(
                     i += 1
                     continue
                 if current is not None:
-                    warnings.append(f"page {page}: a line with amounts but no date was skipped: {line.text[:60]!r}")
+                    state.warnings.append(f"page {page}: a line with amounts but no date was skipped: {line.text[:60]!r}")
                     current = None
                     current_self_narrated = False
                     current_has_numbers = False
@@ -508,29 +552,33 @@ def _rows_from_columns(
                     break
                 run_end += 1
             nxt = seg[run_end] if run_end < len(seg) else None
-            if nxt is not None and not _FOOTER.search(nxt.text):
-                nxt_head_date = find_head_date(nxt.words)
-                # Whether the *open* row already has its own narration (not the upcoming one) is
-                # the signal that actually distinguishes "this run is a continuation of the row in
-                # progress" from "this run is the opening of the row that follows": a row whose own
-                # date line already carried narration doesn't need more appended to it, freeing the
-                # run to belong to what comes next - even if that next row's date line *also*
-                # carries some trailing narration of its own (some banks wrap narration around the
-                # date line, split across a prefix run and a same-line tail, not purely before or
-                # after it - checking the upcoming line instead of the current one, as this used
-                # to, gets exactly that case backwards). A row with no narration of its own (relying
-                # entirely on a wrapped prefix or continuation) is still assumed to want this run.
-                if nxt_head_date is not None and (current is None or current_self_narrated):
-                    for rline in seg[i:run_end]:
+            run = seg[i:run_end]
+            if nxt is not None and not _FOOTER.search(nxt.text) and find_head_date(nxt.words) is not None:
+                if run_belongs_to_next(run, nxt):
+                    for rline in run:
                         pending_prefix.extend(rline.words)
                     i = run_end
                     continue
+                # Otherwise it continues the row above it - or, at the very top of a page with no
+                # row open yet, the last row of the previous page whose narration spilled over.
+                target = current
+                if target is None and len(run) <= 4 and state.last_row is not None and len(state.last_row) == len(out_cols):
+                    target = state.last_row
+                if target is not None:
+                    for rline in run:
+                        for w in rline.words:
+                            put(target, _text_column(w, text_cols, narr_col, has_serial), w.text)
+                        if target is current:
+                            current_mid = rline.mid
+                i = run_end
+                continue
             if current is None:
                 i += 1
                 continue
             for w in ws:
                 col = _text_column(w, text_cols, narr_col, has_serial)
                 put(current, col, w.text)
+            current_mid = line.mid
             i += 1
             continue
 
@@ -573,13 +621,14 @@ def _rows_from_columns(
                 own_text = " ".join(w.text for w in ws if not is_money_like(w.text))
                 cells[index_of[id(narr_col)]] = f"{cells[index_of[id(narr_col)]]} {own_text}".strip()
             rows.append(RawRow(cells, page))
-            current = None
+            current = state.last_row = None
             current_self_narrated = False
             current_has_numbers = False
             i += 1
             continue
         rows.append(RawRow(cells, page))
-        current = cells
+        current = state.last_row = cells
+        current_mid = line.mid
         current_self_narrated = head_date is not None and has_own_narration(ws)
         current_has_numbers = any(cells[index_of[id(c)]] for c in numeric_cols if id(c) in index_of)
         i += 1
