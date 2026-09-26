@@ -39,6 +39,27 @@ def _cell_raw(cells: list[object], mapping: dict[str, list[int]], role: str) -> 
     return cells[idxs[0]] if idxs and idxs[0] < len(cells) else ""
 
 
+_PADDED_REFERENCE_PREFIX = re.compile(r"^0{2,}\d{6,}(?:\s+(\S.*))?$")
+
+
+def _strip_padded_reference_prefix(value: object) -> object:
+    """Some banks print a zero-padded UTR/reference number directly inside the Debit/Credit cell
+    itself, ahead of the real amount when there is one ("0000105526161947 2,520.00"), and with
+    nothing following it at all on a row where that column has no real amount - e.g. a credit-only
+    row still shows the bare reference in the Debit cell ("0000105526161947"). Left alone, that
+    bare reference gets parsed as if it were the amount itself, turning a small transaction into a
+    six-trillion-rupee one. A genuine amount is never zero-padded, so this is a safe, narrow signal
+    - unlike a general "reject long numbers" rule, it won't touch a real (if unusually large) rupee
+    figure that simply lacks decimal paise.
+    """
+    if not isinstance(value, str):
+        return value
+    m = _PADDED_REFERENCE_PREFIX.match(value.strip())
+    if not m:
+        return value
+    return m.group(1) or ""
+
+
 def _indicator_direction(text: str) -> str | None:
     if re.search(r"\b(?:cr|credit)\b", text, re.I):
         return "Credit"
@@ -70,9 +91,9 @@ def build_transactions(rows: list[RawRow], source: str) -> NormalizeResult:
         narration = _cell(cells, mapping, "narration")
         d_raw = _cell_raw(cells, mapping, "date")
         date = parse_date(d_raw)
-        debit = _nonzero(parse_money(_cell_raw(cells, mapping, "debit")))
-        credit = _nonzero(parse_money(_cell_raw(cells, mapping, "credit")))
-        amount_m = _nonzero(parse_money(_cell_raw(cells, mapping, "amount")))
+        debit = _nonzero(parse_money(_strip_padded_reference_prefix(_cell_raw(cells, mapping, "debit"))))
+        credit = _nonzero(parse_money(_strip_padded_reference_prefix(_cell_raw(cells, mapping, "credit"))))
+        amount_m = _nonzero(parse_money(_strip_padded_reference_prefix(_cell_raw(cells, mapping, "amount"))))
         balance_m = parse_money(_cell_raw(cells, mapping, "balance"))
         indicator = _cell(cells, mapping, "indicator")
         has_amount = bool(debit or credit or amount_m)
