@@ -115,11 +115,43 @@ def _table_rows(page, page_no: int, state: LayoutState) -> list[RawRow] | None:
     return rows if dated else None
 
 
-def _pdf_words(page) -> list[Word]:
+def _pdf_words(page, fitz_page=None) -> list[Word]:
+    # pdfplumber runs words together on statements that draw spaces without advancing the cursor
+    # ("UPI-AMARCHAND"); PyMuPDF keeps them, so prefer it for the word list when it is available.
+    if fitz_page is not None:
+        try:
+            fwords = [
+                Word(w[4], w[0], w[2], w[1], w[3])
+                for w in fitz_page.get_text("words")
+                if w[4].strip()
+            ]
+            if fwords:
+                return fwords
+        except Exception:
+            pass
     return [
         Word(w["text"], w["x0"], w["x1"], w["top"], w["bottom"])
         for w in page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
     ]
+
+
+def _fitz_open(data: bytes, password: str | None):
+    try:
+        import fitz
+
+        doc = fitz.open(stream=data, filetype="pdf")
+        if doc.needs_pass and not doc.authenticate(password or ""):
+            return None
+        return doc
+    except Exception:
+        return None
+
+
+def _fitz_page(doc, page_no: int):
+    try:
+        return doc[page_no - 1] if doc is not None else None
+    except Exception:
+        return None
 
 
 def extract_pdf(data: bytes, password: str | None = None, ocr_mode: str = "auto") -> ExtractResult:
@@ -129,6 +161,7 @@ def extract_pdf(data: bytes, password: str | None = None, ocr_mode: str = "auto"
     methods: set[str] = set()
     ocr_pages: list[int] = []
     warnings: list[str] = []
+    fdoc = _fitz_open(data, password)
     with _open(data, password) as pdf:
         total = len(pdf.pages)
         for page_no, page in enumerate(pdf.pages, start=1):
@@ -155,7 +188,7 @@ def extract_pdf(data: bytes, password: str | None = None, ocr_mode: str = "auto"
                         rows.extend(table)
                         methods.add("pdf-table")
                     else:
-                        rows.extend(layout_page(_pdf_words(page), page_no, state))
+                        rows.extend(layout_page(_pdf_words(page, _fitz_page(fdoc, page_no)), page_no, state))
                         methods.add("pdf-text")
             finally:
                 page.flush_cache()

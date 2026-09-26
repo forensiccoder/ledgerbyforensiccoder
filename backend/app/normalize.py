@@ -25,6 +25,25 @@ _KNOWN_FOOTER_SUFFIX = re.compile(
 )
 
 
+# A chunk boundary sometimes swallows the single space that started the next chunk.
+def _loose(phrase: str) -> re.Pattern[str]:
+    """The phrase with an optional stray space allowed between any two of its letters."""
+    letters = [re.escape(ch) for ch in phrase.replace(" ", "")]
+    return re.compile(r"\s?".join(letters))
+
+
+_CHUNK_BOUNDARY_REPAIRS = [
+    (_loose("PAYMENT FROM PHONE"), "PAYMENT FROM PHONE"),
+    (re.compile(r"-PAYTO (?=\S)"), "-PAY TO "),
+]
+
+
+def _repair_chunk_boundaries(text: str) -> str:
+    for pattern, repl in _CHUNK_BOUNDARY_REPAIRS:
+        text = pattern.sub(repl, text)
+    return text
+
+
 def _nonzero(m: Money | None) -> Money | None:
     return None if m is None or m.value == 0 else m
 
@@ -100,7 +119,7 @@ def build_transactions(rows: list[RawRow], source: str) -> NormalizeResult:
         if mapping is None:
             continue
 
-        narration = _KNOWN_FOOTER_SUFFIX.sub("", _cell(cells, mapping, "narration")).strip()
+        narration = _repair_chunk_boundaries(_KNOWN_FOOTER_SUFFIX.sub("", _cell(cells, mapping, "narration")).strip())
         d_raw = _cell_raw(cells, mapping, "date")
         date = parse_date(d_raw)
         debit = _nonzero(parse_money(_strip_padded_reference_prefix(_cell_raw(cells, mapping, "debit"))))

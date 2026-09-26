@@ -32,6 +32,7 @@ class Word:
     x1: float
     top: float
     bottom: float
+    line_start: bool = False  # first word on its printed line (set by group_lines)
 
     @property
     def cx(self) -> float:
@@ -73,6 +74,11 @@ class LayoutState:
     # ranges rather than trusted at face value by raw cell index.
     table_header_cells: list[str] | None = None
     table_col_ranges: list[tuple[float, float] | None] | None = None
+    # Some banks (HDFC) chop each narration into fixed-width chunks (40 characters) and then let
+    # the printed cell wrap on top of that, so a printed line break is sometimes *inside* a word
+    # ("PAYMEN" / "T FROM PHONE") and sometimes at a space. 0 = not detected; else the chunk width.
+    hard_wrap: int = 0
+    chunk_len: dict = field(default_factory=dict)  # (id(row cells), column) -> length of open chunk
     warnings: list[str] = field(default_factory=list)
     # Which side of a row's date line its wrapped narration lines sit on is a property of the
     # statement's layout, not of any one row: text-only statements print continuation lines *below*
@@ -94,6 +100,7 @@ _FOOTER = re.compile(
     # words of "office" rather than requiring them adjacent.
     r"(?:registered|regd\.?|corporate)\s*(?:[&,]|and)?\s*(?:regd\.?|corporate\s+)?\s*office|"
     r"statement (?:summary|of account)|generated (?:on|by)|legends?\b|"
+    r"closing\s*balance\s*includes\s*funds|contents\s*of\s*this\s*statement|^hdfc\s*bank\s*limited\s*$|"
     r"abbreviations|customer care|toll[\s-]?free|nomination|this is a system|\bgstin\b|"
     r"important (?:notice|information)|unless the constituent|contents of this statement",
     re.I,
@@ -124,6 +131,9 @@ def group_lines(words: list[Word]) -> list[Line]:
             lines.append(Line([w], mid))
     for line in lines:
         line.words.sort(key=lambda w: w.x0)
+        for w in line.words:
+            w.line_start = False
+        line.words[0].line_start = True
         _attach_suffixes(line)
     return lines
 
@@ -375,6 +385,8 @@ def _fix_ocr_number(text: str) -> str:
 
 def layout_page(words: list[Word], page: int, state: LayoutState, ocr: bool = False) -> list[RawRow]:
     lines = group_lines(words)
+    if not state.hard_wrap and not ocr:
+        state.hard_wrap = _detect_hard_wrap(lines)
     found = find_header(lines, fuzzy=ocr)
     start = 0
     if found:
@@ -394,6 +406,24 @@ def layout_page(words: list[Word], page: int, state: LayoutState, ocr: bool = Fa
             "original statement."
         )
     return _rows_from_columns(lines, columns, page, ocr, start, state)
+
+
+_HARD_WRAP_WIDTH = 40
+
+
+def _detect_hard_wrap(lines: list[Line]) -> int:
+    """Recognise statements whose narration is chopped into exactly-40-character chunks: a text-only
+    line (no date, no amount) is very often exactly that long, which ordinary wrapping never does."""
+    text_only = [
+        l for l in lines
+        if find_date_free(l) and len(l.text) > 20
+    ]
+    full = sum(1 for l in text_only if len(l.text) == _HARD_WRAP_WIDTH)
+    return _HARD_WRAP_WIDTH if full >= 5 and full >= 0.25 * len(text_only) else 0
+
+
+def find_date_free(line: Line) -> bool:
+    return not _date_spans(line.words) and not any(is_money_like(w.text) for w in line.words)
 
 
 def _rows_from_columns(
@@ -434,11 +464,24 @@ def _rows_from_columns(
     def blank() -> list[str]:
         return [""] * len(out_cols)
 
-    def put(cells: list[str], col: Column | None, text: str) -> None:
+    def put(cells: list[str], col: Column | None, text: str, brk: bool = False) -> None:
         if col is None or id(col) not in index_of:
             return
         k = index_of[id(col)]
+        if state.hard_wrap and col is narr_col and cells[k]:
+            key = (id(cells), k)
+            used_len = state.chunk_len.get(key, len(cells[k]))
+            if brk and used_len >= state.hard_wrap - 3:
+                # the previous printed line ended a full chunk: the break may be mid-word
+                cells[k] += text
+                state.chunk_len[key] = len(text)
+            else:
+                cells[k] += " " + text
+                state.chunk_len[key] = used_len + 1 + len(text)
+            return
         cells[k] = f"{cells[k]} {text}".strip()
+        if state.hard_wrap and col is narr_col:
+            state.chunk_len[(id(cells), k)] = len(text)
 
     def find_head_date(ws: list[Word]) -> tuple[int, int] | None:
         spans = _date_spans(ws)
@@ -562,12 +605,27 @@ def _rows_from_columns(
                 # Otherwise it continues the row above it - or, at the very top of a page with no
                 # row open yet, the last row of the previous page whose narration spilled over.
                 target = current
-                if target is None and len(run) <= 4 and state.last_row is not None and len(state.last_row) == len(out_cols):
-                    target = state.last_row
+                spill = run
+                if target is None and state.last_row is not None and len(state.last_row) == len(out_cols):
+                    # Only the trailing lines that sit inside the narration column count: a page
+                    # without its own header row also has page-header text before the first row.
+                    spill = []
+                    for rline in reversed(run):
+                        # (narration text usually starts left of its header, so measure from the
+                        # date column instead)
+                        left_edge = (date_col.x0 + 25) if date_col is not None else (narr_col.x0 - 8 if narr_col else 0)
+                        inside = narr_col is not None and all(
+                            w.x0 >= left_edge and w.x1 < first_num_x0 for w in rline.words
+                        )
+                        if not inside or len(spill) >= 4:
+                            break
+                        spill.insert(0, rline)
+                    if spill:
+                        target = state.last_row
                 if target is not None:
-                    for rline in run:
+                    for rline in spill:
                         for w in rline.words:
-                            put(target, _text_column(w, text_cols, narr_col, has_serial), w.text)
+                            put(target, _text_column(w, text_cols, narr_col, has_serial), w.text, w.line_start)
                         if target is current:
                             current_mid = rline.mid
                 i = run_end
@@ -577,7 +635,7 @@ def _rows_from_columns(
                 continue
             for w in ws:
                 col = _text_column(w, text_cols, narr_col, has_serial)
-                put(current, col, w.text)
+                put(current, col, w.text, w.line_start)
             current_mid = line.mid
             i += 1
             continue
@@ -586,7 +644,7 @@ def _rows_from_columns(
         if pending_prefix:
             for w in pending_prefix:
                 col = _text_column(w, text_cols, narr_col, has_serial)
-                put(cells, col, w.text)
+                put(cells, col, w.text, w.line_start)
             pending_prefix = []
         used: set[int] = set()
         if head_date:
@@ -601,6 +659,7 @@ def _rows_from_columns(
                     used.update(range(s[0], s[1] + 1))
                     put(cells, value_date_col, " ".join(w.text for w in ws[s[0]:s[1] + 1]))
                     break
+        first_narration_word = True
         for wi, w in enumerate(ws):
             if wi in used:
                 continue
@@ -610,7 +669,11 @@ def _rows_from_columns(
                 if col.role in NUMERIC_ROLES:
                     put(cells, col, _fix_ocr_number(text) if ocr else text)
                 continue  # role-less trailing columns (branch code etc.) are dropped
-            put(cells, _text_column(w, text_cols, narr_col, has_serial), text)
+            tcol = _text_column(w, text_cols, narr_col, has_serial)
+            # on a date line the first narration word starts a new printed line for the wrap logic
+            put(cells, tcol, text, w.line_start or (tcol is narr_col and first_narration_word))
+            if tcol is narr_col:
+                first_narration_word = False
         if marker and not head_date:
             # Opening/closing balance line: keep the last number found as the balance.
             nums = [w.text for w in ws if is_money_like(w.text)]
