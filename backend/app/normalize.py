@@ -53,8 +53,24 @@ def _repair_slash_imps(text: str) -> str:
     return "/".join(p.strip() if i != 2 else p.strip() for i, p in enumerate(parts))
 
 
+_VPA_DOMAIN_FIX = {"ypbl": "ybl", "ypbi": "ybl", "ybi": "ybl", "yb!": "ybl", "yb1": "ybl", "yb|": "ybl", "ibi": "ibl", "ib!": "ibl", "axi": "axl"}
+
+
+def _repair_vpa(text: str) -> str:
+    """UPI handles in scanned text: a space before the '@' ("8058332931 @ybl") and look-alike
+    characters in the bank suffix ("@ybI:", "@yb!", "@ypbl") - one handle, one spelling."""
+    text = re.sub(r"(?<=\w)\s+@(?=[A-Za-z])", "@", text)
+    text = re.sub(r"(?<=[A-Za-z]) (?=\d{1,2}@[A-Za-z])", "", text)  # "AIRTELPREDIRECT 1@ybl"
+
+    def fix(m: re.Match[str]) -> str:
+        suffix = m.group(1)
+        return "@" + _VPA_DOMAIN_FIX.get(suffix.lower(), suffix)
+
+    return re.sub(r"@([A-Za-z0-9!|]{2,5})(?=[:.'\s]|$)", fix, text)
+
+
 def _repair_chunk_boundaries(text: str) -> str:
-    text = _repair_slash_imps(text)
+    text = _repair_vpa(_repair_slash_imps(text))
     for pattern, repl in _CHUNK_BOUNDARY_REPAIRS:
         text = pattern.sub(repl, text)
     return text

@@ -49,7 +49,7 @@ def _auto_rotate(img: Image.Image, pytesseract) -> Image.Image:
     try:
         osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
         angle = int(osd.get("rotate", 0))
-        if angle in (90, 180, 270) and float(osd.get("orientation_conf", 0)) >= 2:
+        if angle in (90, 180, 270) and float(osd.get("orientation_conf", 0)) >= 8:
             return img.rotate(-angle, expand=True, fillcolor="white")
     except Exception:
         pass

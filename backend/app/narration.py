@@ -71,6 +71,9 @@ _MARKER_WORDS = r"CR|DR|TO|BY|FROM|IN|OUT|REF|NO|CREDIT|DEBIT|REV|REVERSAL|REVER
 # reached - so both word lists are combined into one repeating strip.
 _STRIP_ALWAYS = re.compile(
     rf"^(?:(?:NEFT|RTGS|IMPS|UPIAR|UPI|UTR|RRN|INF|INB|TRANSFER|TRF|P2A|P2M|P2P|P2B|"
+    # A bank's own transaction-type prefix ("WDL TFR", "DEP TFR"), as its scans are often misread
+    # ("WOL TER", "WODL TPR"): not a name.
+    rf"W[DOI]{{1,2}}L|WDE|T[FEP]R|DEP|"
     rf"{_MARKER_WORDS})\b[\s:._#-]*)+",
     re.I,
 )
@@ -399,6 +402,9 @@ def _other_details(narration: str) -> tuple[str, str]:
     if re.match(r"^FT-", text, re.I):
         names = _name_segments(text[3:])
         return "Fund transfer", names[0] if names else ""
+    m = re.match(r"^(?:By|To)\s+Transfer\s*[:\-]\s*([A-Za-z][A-Za-z .&]{2,})$", text, re.I)
+    if m:
+        return "Transfer", m.group(1).strip()
     m = _NAME_THEN_REMARK.match(text)
     if m and not re.match(r"^(?:IB|CHRG|REM|INT|BRN|INTER|CHEQUE|NEFT|IMPS|UPI|RTGS)\b", text, re.I):
         return "", m.group(1).strip()

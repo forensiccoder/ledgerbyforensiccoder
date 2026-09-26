@@ -417,31 +417,47 @@ _DIGIT_CONFUSION = {"0": "986", "1": "47", "2": "7", "3": "8", "4": "1", "5": "6
 
 def _repair_ocr_dates(words: list[Word], previous: date | None) -> tuple[list[Word], date | None]:
     """Fix date-shaped tokens the OCR misread ("46-11-2024" for 16-11-2024, "98-07-2024",
-    "1206-2024"), so their rows are not thrown away as undated.
+    "1206-2024", or a year read as 2024 for 2023), so their rows are not thrown away as undated or
+    filed in the wrong month.
 
-    A statement's rows run in date order, so of the readings reachable by swapping one or two
-    commonly confused digits, the valid one closest to (and not before) the previous row's date is
-    taken. Only tokens that do not already parse are touched.
+    A statement covers a short span, so a date far from its neighbours is a misreading. Of the
+    readings reachable by swapping one or two commonly confused digits, the valid one closest to the
+    median of the surrounding dates (within 45 days of it) is taken. Order-agnostic, so it works for
+    ascending and descending statements alike.
     """
     import itertools
+    import statistics as st
 
     ordered = sorted(range(len(words)), key=lambda k: (words[k].top + words[k].bottom) / 2)
-    out = list(words)
+    tokens: list[tuple[int, str, date | None]] = []
     for k in ordered:
         w = words[k]
         if w.x0 > 400 or not _DATE_SHAPE.match(w.text.strip()):
             continue
         core = re.sub(r"[|\[\]()]", "", w.text.strip())
-        if parse_date(core, strict=True):
-            previous = parse_date(core, strict=True)
-            continue
         m = re.match(r"^(\d{2})(\d{2})[-/.](\d{4})$", core)
         if m:
             core = f"{m[1]}-{m[2]}-{m[3]}"
-            if parse_date(core, strict=True):
+        tokens.append((k, core, parse_date(core, strict=True)))
+    if not tokens:
+        return words, previous
+    valid = [t[2].toordinal() for t in tokens if t[2]]
+    if previous is not None:
+        valid.append(previous.toordinal())
+    if not valid:
+        return words, previous
+    typical = st.median(valid)
+    out = list(words)
+    last = previous
+    for idx, (k, core, parsed) in enumerate(tokens):
+        w = words[k]
+        near = [t[2].toordinal() for t in tokens[max(0, idx - 4): idx + 5] if t[2] and t[0] != k]
+        ref = st.median(near) if near else typical
+        if parsed and abs(parsed.toordinal() - ref) <= 45:
+            last = parsed
+            if core != w.text.strip():
                 out[k] = Word(core, w.x0, w.x1, w.top, w.bottom, w.line_start)
-                previous = parse_date(core, strict=True)
-                continue
+            continue
         digits = [i for i, ch in enumerate(core) if ch.isdigit()]
         best = None
         for count in (1, 2):
@@ -451,21 +467,19 @@ def _repair_ocr_dates(words: list[Word], previous: date | None) -> tuple[list[Wo
                     for i, r in zip(spots, repl):
                         chars[i] = r
                     candidate = "".join(chars)
-                    parsed = parse_date(candidate, strict=True)
-                    if not parsed:
+                    cand = parse_date(candidate, strict=True)
+                    if not cand or abs(cand.toordinal() - ref) > 45:
                         continue
-                    if previous is not None:
-                        gap = (parsed - previous).days
-                        if gap < 0 or gap > 120:
-                            continue
-                    if best is None or (previous is not None and abs((parsed - previous).days) < abs((best[0] - previous).days)):
-                        best = (parsed, candidate)
+                    if best is None or abs(cand.toordinal() - ref) < abs(best[0].toordinal() - ref):
+                        best = (cand, candidate)
             if best:
                 break
         if best:
             out[k] = Word(best[1], w.x0, w.x1, w.top, w.bottom, w.line_start)
-            previous = best[0]
-    return out, previous
+            last = best[0]
+        elif parsed:
+            last = parsed
+    return out, last
 
 
 def _is_ocr_junk(token: str) -> bool:
@@ -478,6 +492,31 @@ def _is_ocr_junk(token: str) -> bool:
     if any(ch.isdigit() or ch in "/@&#%" for ch in core):
         return False
     return len(core) <= 4 and not core.isupper()
+
+
+def _merge_split_money(words: list[Word]) -> list[Word]:
+    """Rejoin a figure whose decimal point the OCR lost: "5000 00" -> "5000.00", "803 27Cr" ->
+    "803.27Cr". Only in the money columns (right of the page's midline), where a whole number
+    directly followed by a two-digit tail on the same line can only be rupees and paise."""
+    if not words:
+        return words
+    width = max(w.x1 for w in words)
+    ordered = sorted(words, key=lambda w: ((w.top + w.bottom) / 2, w.x0))
+    out: list[Word] = []
+    skip: set[int] = set()
+    for k, w in enumerate(ordered):
+        if id(w) in skip:
+            continue
+        if w.x0 > 0.5 * width and re.fullmatch(r"\d{1,9}", w.text.replace(",", "")):
+            for nxt in ordered[k + 1:k + 4]:
+                if id(nxt) in skip or abs((nxt.top + nxt.bottom) / 2 - (w.top + w.bottom) / 2) > 3:
+                    continue
+                if 0 <= nxt.x0 - w.x1 <= 14 and re.fullmatch(r"\d{2}(?:cr|dr)?\.?", nxt.text, re.I):
+                    skip.add(id(nxt))
+                    w = Word(f"{w.text}.{nxt.text.rstrip('.')}", w.x0, nxt.x1, min(w.top, nxt.top), max(w.bottom, nxt.bottom), w.line_start)
+                    break
+        out.append(w)
+    return out
 
 
 def _header_block_end(lines: list[Line]) -> int:
@@ -523,7 +562,7 @@ def plan_ocr_columns(pages: list[list[Word]]) -> list[list[Column] | None]:
     prepared: list[list[Word]] = []
     state_date: date | None = None
     for words in pages:
-        fixed, state_date = _repair_ocr_dates(words, state_date)
+        fixed, state_date = _repair_ocr_dates(_merge_split_money(words), state_date)
         prepared.append(_dewarp(fixed))
     best: tuple[int, list[Column], tuple[float, float]] | None = None
     for words in prepared:
@@ -659,6 +698,7 @@ def layout_page(
     columns_override: list[Column] | None = None,
 ) -> list[RawRow]:
     if ocr:
+        words = _merge_split_money(words)
         words, state.last_date = _repair_ocr_dates(words, state.last_date)
         words = _dewarp(words)
     lines = group_lines(words)
