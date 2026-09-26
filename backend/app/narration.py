@@ -62,13 +62,18 @@ _RRN = re.compile(r"^\d{12}$")
 _VPA_TOKEN = re.compile(r"^[A-Za-z0-9._+\-]{2,}@[A-Za-z][A-Za-z0-9.]{1,}$")
 _UTR = re.compile(r"^(?=(?:.*\d){8,})[A-Z0-9]{12,}$")
 _LONG_NUMBER = re.compile(r"^\d{9,}$")
+_MARKER_WORDS = r"CR|DR|TO|BY|FROM|IN|OUT|REF|NO|CREDIT|DEBIT|REV|REVERSAL|REVERSED|REFUND"
+# Channel keywords and direction markers can appear interleaved ("NEFT OUT NEFT/<ref>/<name>/..."
+# - some banks repeat the channel word around the direction word). Stripping only a single
+# contiguous run of one or the other left leftovers like "OUT NEFT" behind, which then got
+# mistaken for the counterparty name before the real one (later in the narration) was ever
+# reached - so both word lists are combined into one repeating strip.
 _STRIP_ALWAYS = re.compile(
-    r"^(?:(?:NEFT|RTGS|IMPS|UPIAR|UPI|UTR|RRN|INF|INB|TRANSFER|TRF|P2A|P2M|P2P|P2B)\b[\s:._#-]*)+",
+    rf"^(?:(?:NEFT|RTGS|IMPS|UPIAR|UPI|UTR|RRN|INF|INB|TRANSFER|TRF|P2A|P2M|P2P|P2B|"
+    rf"{_MARKER_WORDS})\b[\s:._#-]*)+",
     re.I,
 )
-_ALL_MARKERS = re.compile(
-    r"^(?:(?:CR|DR|TO|BY|FROM|IN|OUT|REF|NO|CREDIT|DEBIT|REV|REVERSAL|REVERSED|REFUND)\b[\s:._#-]*)+$", re.I
-)
+_ALL_MARKERS = re.compile(rf"^(?:(?:{_MARKER_WORDS})\b[\s:._#-]*)+$", re.I)
 _GENERIC_REMARK = re.compile(
     r"^(?:payment|paid|sent|pay|collect|request|towards|mandate|autopay|remarks?|na|nil|"
     r"via|thanks?|for|upi|oth(?:er)?s?)\b",
