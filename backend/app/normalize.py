@@ -38,7 +38,23 @@ _CHUNK_BOUNDARY_REPAIRS = [
 ]
 
 
+_IMPS_SLASH_FORMAT = re.compile(r"^(?:Recd:|Sent:|Rcvd:)?IMPS/\d{10,14}/", re.I)
+
+
+def _repair_slash_imps(text: str) -> str:
+    """"Recd:IMPS/<rrn>/<name>/<bank>/<account>/<remark>": the printed cell wraps in the middle of
+    the short bank-code and masked-account fields ("KKB K", "X26 50"), which never contain spaces."""
+    if not _IMPS_SLASH_FORMAT.match(text):
+        return text
+    parts = text.split("/")
+    for i in (3, 4):
+        if i < len(parts):
+            parts[i] = "".join(parts[i].split())
+    return "/".join(p.strip() if i != 2 else p.strip() for i, p in enumerate(parts))
+
+
 def _repair_chunk_boundaries(text: str) -> str:
+    text = _repair_slash_imps(text)
     for pattern, repl in _CHUNK_BOUNDARY_REPAIRS:
         text = pattern.sub(repl, text)
     return text

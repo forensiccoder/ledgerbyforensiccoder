@@ -294,6 +294,9 @@ def _decompose(text: str) -> _Parts:
 _UPI_WORD = re.compile(r"(?<![A-Z0-9])UPI(?![A-Z0-9])|(?<![A-Z0-9])UPIAR(?![A-Z0-9])", re.I)
 _NEFT_WORD = re.compile(r"(?<![A-Z0-9])NEFT(?![A-Z0-9])", re.I)
 _RTGS_WORD = re.compile(r"(?<![A-Z0-9])RTGS(?![A-Z0-9])", re.I)
+_IMPS_SLASH = re.compile(r"^(?:Recd:|Sent:|Rcvd:)?IMPS/(\d{10,14})/([^/]*)/", re.I)
+# "UPI_CRADJ_U2_TDT_050825_521761161884_ 06AUG2025_9C": a UPI credit adjustment - no payer named.
+_UPI_ADJUSTMENT = re.compile(r"^UPI_(?:CR|DR)ADJ_\S*?_(\d{12})_", re.I)
 _IMPS_WORD = re.compile(r"(?<![A-Z0-9])IMPS(?![A-Z0-9])", re.I)
 _FEE = re.compile(
     r"\b(?:chg|chgs|chrg|chrgs|charge|charges|fee|fees|commission|comm|gst|cgst|sgst|igst|amc|"
@@ -383,6 +386,15 @@ def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo
         info.reference = _generic_reference(text)
         return info
 
+    # 1.5. UPI credit/debit adjustment: a UPI movement with the RRN embedded, but no counterparty.
+    adj = _UPI_ADJUSTMENT.match(narration.strip())
+    if adj:
+        info.category = UPI
+        info.channel = "UPI"
+        info.reference = adj.group(1)
+        info.flags.append("counterparty_not_found")
+        return info
+
     # 2. UPI
     if _UPI_WORD.search(text) or (parts.vpa and parts.rrn):
         info.category = UPI
@@ -421,6 +433,11 @@ def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo
         info.category = IMPS
         info.channel = "IMPS"
         _apply_parts(info, parts, parts.rrn or parts.utr or parts.number or _generic_reference(text))
+        slash = _IMPS_SLASH.match(narration.strip())
+        if slash:
+            # "Recd:IMPS/<rrn>/<payer name>/<bank>/<account>/<remark>": the name is the third field.
+            info.reference = slash.group(1)
+            parts.name = slash.group(2).strip(" .-") or parts.name
         info.counterparty = parts.name or parts.vpa
         info.confidence = "high" if parts.name and info.reference else "medium"
         if not parts.name:
