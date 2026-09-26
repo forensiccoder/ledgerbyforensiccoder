@@ -134,7 +134,7 @@ export default function Home() {
     const counterpartyMatches = activeCounterparty === "All" || transaction.beneficiary === activeCounterparty;
     const searchText = `${transaction.beneficiary} ${transaction.narration} ${transaction.reference}`.toLowerCase();
     return categoryMatches && counterpartyMatches && searchText.includes(search.trim().toLowerCase());
-  }).sort((a, b) => b.dateIso.localeCompare(a.dateIso)), [targetTransactions, activeCategory, activeCounterparty, search]);
+  }).sort((a, b) => a.dateIso.localeCompare(b.dateIso)), [targetTransactions, activeCategory, activeCounterparty, search]);
 
   // Net, not gross: a category like NEFT or UPI can hold both incoming and outgoing transactions,
   // so summing every amount as positive would overstate what actually moved. Cash deposit/
