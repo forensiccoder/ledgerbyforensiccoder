@@ -11,6 +11,18 @@ from .money import Money, parse_date, parse_money
 _MARKER_OPEN = re.compile(r"^\s*(?:opening\s+balance|balance\s+(?:b/?f|brought)|brought\s+forward|b/f\b)", re.I)
 _MARKER_CLOSE = re.compile(r"^\s*(?:closing\s+balance|balance\s+(?:c/?f|carried)|carried\s+forward|c/f\b)", re.I)
 _MARKER_TOTAL = re.compile(r"^\s*(?:grand\s+)?total\b|page\s+total|statement\s+summary", re.I)
+# At least one bank (HDFC) prints a standard legal disclaimer footer on every page ("Closing
+# balance includes funds earmarked for hold and uncleared funds. Contents of this statement will
+# be considered correct if no error is reported within 30 days...") right after the last row's own
+# text, with no row/line boundary of its own to separate it - and PDF text extraction sometimes
+# drops the spaces between its words entirely ("Closingbalanceincludesfunds..."), which is also why
+# app/layout.py's _FOOTER pattern (which requires literal spaces) never catches it. The result is
+# this disclaimer landing inside a real transaction's narration - and since it's the same wording
+# every time, cut everything from its first recognisable phrase onward, spaces or not.
+_KNOWN_FOOTER_SUFFIX = re.compile(
+    r"\s*(?:HDFC\s*BANK\s*LIMITED\s*)?\*?\s*closing\s*balance\s*includes\s*funds\s*earmarked.*$",
+    re.I | re.S,
+)
 
 
 def _nonzero(m: Money | None) -> Money | None:
@@ -88,7 +100,7 @@ def build_transactions(rows: list[RawRow], source: str) -> NormalizeResult:
         if mapping is None:
             continue
 
-        narration = _cell(cells, mapping, "narration")
+        narration = _KNOWN_FOOTER_SUFFIX.sub("", _cell(cells, mapping, "narration")).strip()
         d_raw = _cell_raw(cells, mapping, "date")
         date = parse_date(d_raw)
         debit = _nonzero(parse_money(_strip_padded_reference_prefix(_cell_raw(cells, mapping, "debit"))))

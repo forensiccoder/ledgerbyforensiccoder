@@ -80,6 +80,33 @@ _GENERIC_REMARK = re.compile(
     r"via|thanks?|for|upi|oth(?:er)?s?)\b",
     re.I,
 )
+
+
+def _tolerant(phrase: str) -> str:
+    """A regex matching `phrase` (spaces stripped, given normally) that tolerates a space being
+    dropped or landing anywhere inside it, and the phrase itself being cut short. At least one
+    bank's PDF text extraction mangles its own boilerplate remark text seemingly at random - the
+    same "payment from phone" comes out as "PAYMENTFROMPHONE", "PAYMENTFROMPH ONE",
+    "P AYMENTFROMPHONE" and more across a single statement - so tolerating whitespace only at the
+    phrase's own word boundaries isn't enough, and requiring the whole phrase isn't safe either
+    when the same extraction quirk can just as easily drop trailing letters.
+    """
+    return r"\s*".join(re.escape(ch) for ch in phrase.replace(" ", ""))
+
+
+# Boilerplate remark phrases observed mangled this way in real statements - a bare generic
+# descriptor of the payment channel/method, never a counterparty name. Deliberately has no
+# trailing \b (unlike _GENERIC_REMARK above): matching just the reliably-intact prefix has to be
+# enough, since the same mangling that drops/misplaces spaces can just as easily truncate the tail.
+_MANGLED_BOILERPLATE = re.compile(
+    "^(?:" + "|".join(_tolerant(p) for p in (
+        "payment from phone", "collect request fr", "sent using paytm",
+        "pay via razorpay", "payment for ref", "imps transaction", "money transfer",
+    )) + ")",
+    re.I,
+)
+# A bank's own masked account/card number ("XXXX9542" for one ending 9542) is never a name.
+_MASKED_NUMBER = re.compile(r"^X{2,}\d*$", re.I)
 _CHANNEL_NOISE = re.compile(
     r"^(?:net\s*bank|netbanking|mobile|mob\b|internet|online|ib\b|mb\b|ecs|nach|neti|inb|bill\s*pay)",
     re.I,
@@ -176,9 +203,11 @@ def _kind(token: str) -> str:
         return "number"
     if _is_bank(token):
         return "bank"
+    if _MASKED_NUMBER.match(token):
+        return "junk"
     if not re.search(r"[A-Za-z]{3}", token):
         return "junk"
-    if _GENERIC_REMARK.match(token) or _CHANNEL_NOISE.match(token):
+    if _GENERIC_REMARK.match(token) or _CHANNEL_NOISE.match(token) or _MANGLED_BOILERPLATE.match(token):
         return "remark"
     return "name"
 
