@@ -367,6 +367,44 @@ def _apply_parts(info: NarrationInfo, parts: _Parts, reference: str) -> None:
     info.direction_hint = parts.hint
 
 
+# ---- Counterparties for the miscellaneous ("Other") rows -----------------------------------------
+_TPT = re.compile(r"^\s*\d{6,}-TPT-[A-Z]-(.+?)\s*$", re.I)
+_ACH_NAME = re.compile(r"^\s*ACH\s+D-\s*(.+?)(?:-[A-Z]*\d\w*)?\s*$", re.I)
+_RTGS_NAME = re.compile(r"^\s*RTGS\s+(?:CR|DR)-[A-Z]{4}0[A-Z0-9]{6}-(.+?)-", re.I)
+_NAME_THEN_REMARK = re.compile(r"^\s*([A-Za-z][A-Za-z.]*(?: [A-Za-z][A-Za-z.]*){0,4}) -(?=[A-Za-z])")
+_NAME_SEGMENT = re.compile(r"[A-Za-z][A-Za-z .&]*[A-Za-z.]")
+_NOT_NAMES = {"FT", "NACH", "ACH", "TPT", "A2AINT01", "P", "M", "RETURN", "COMMON REDEMPTION A/C"}
+
+
+def _name_segments(text: str) -> list[str]:
+    parts = re.split(r"\s+-\s*|-{1,2}", text)
+    return [p.strip() for p in parts
+            if _NAME_SEGMENT.fullmatch(p.strip()) and len(p.strip()) > 3 and p.strip().upper() not in _NOT_NAMES]
+
+
+def _other_details(narration: str) -> tuple[str, str]:
+    """(channel label, counterparty) for narration shapes that are not a target category but do name
+    a party: own-account transfers ("...-TPT-P-NAME"), ACH debits, fund transfers, loan credits."""
+    text = " ".join(narration.split())
+    m = _TPT.match(text)
+    if m:
+        return "Transfer (TPT)", m.group(1).strip()
+    m = _ACH_NAME.match(text)
+    if m:
+        names = _name_segments(m.group(1))
+        return "", names[0] if names else ""
+    if re.match(r"^A2AINT\d+--", text, re.I):
+        names = _name_segments(text)
+        return "Fund transfer", names[-1] if names else ""
+    if re.match(r"^FT-", text, re.I):
+        names = _name_segments(text[3:])
+        return "Fund transfer", names[0] if names else ""
+    m = _NAME_THEN_REMARK.match(text)
+    if m and not re.match(r"^(?:IB|CHRG|REM|INT|BRN|INTER|CHEQUE|NEFT|IMPS|UPI|RTGS)\b", text, re.I):
+        return "", m.group(1).strip()
+    return "", ""
+
+
 def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo:
     """Classify a narration. ``direction`` is "Credit"/"Debit"/"Unknown" (from the amount columns)."""
     text = _norm_text(narration)
@@ -424,6 +462,9 @@ def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo
     if _RTGS_WORD.search(text):
         info.channel = "RTGS"
         info.reference = parts.utr or parts.number or parts.rrn or _generic_reference(text)
+        rtgs = _RTGS_NAME.match(" ".join(narration.split()))
+        if rtgs:
+            info.counterparty = rtgs.group(1).strip()
         return info
 
     # 3.6. IMPS - an interbank transfer like NEFT, just settled instantly rather than in a batch,
@@ -515,6 +556,10 @@ def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo
         if pattern.search(text):
             info.channel = label
             break
+    detail_label, detail_name = _other_details(narration)
+    if detail_label and not info.channel:
+        info.channel = detail_label
+    info.counterparty = detail_name
     info.reference = parts.rrn or parts.utr or _generic_reference(text)
     info.direction_hint = parts.hint
     return info

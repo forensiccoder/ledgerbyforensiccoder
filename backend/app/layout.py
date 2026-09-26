@@ -461,6 +461,14 @@ def _rows_from_columns(
     current_mid = 0.0
     pending_prefix: list[Word] = []
 
+    def is_amount_word(w: Word) -> bool:
+        """A money-shaped word in the numeric area. A bare integer that only *reaches* into it (a
+        right-aligned reference number wider than its header, e.g. "308067" under "Chq./Ref.No.")
+        is not an amount: real amounts carry decimals/separators or start inside the numeric area."""
+        if not is_money_like(w.text) or w.x1 < first_num_x0 - 3:
+            return False
+        return "." in w.text or "," in w.text or w.x0 >= first_num_x0 - 3
+
     def blank() -> list[str]:
         return [""] * len(out_cols)
 
@@ -565,7 +573,7 @@ def _rows_from_columns(
             # be checked even when there is no ``current`` row (e.g. right after a stray
             # amount-without-date line reset it below) - the prefix run belongs to the row that
             # follows it, not to whatever row happened to come before.
-            extra_numeric = [w for w in ws if is_money_like(w.text) and w.x1 >= first_num_x0 - 3 and text_cols]
+            extra_numeric = [w for w in ws if is_amount_word(w) and text_cols]
             if extra_numeric:
                 if current is not None and not current_has_numbers:
                     # The open row's own date line had no Debit/Credit/Balance of its own - the
@@ -591,7 +599,7 @@ def _rows_from_columns(
                 rline = seg[run_end]
                 if _FOOTER.search(rline.text) or find_head_date(rline.words) is not None or _BALANCE_MARKER.match(rline.text):
                     break
-                if [w for w in rline.words if is_money_like(w.text) and w.x1 >= first_num_x0 - 3 and text_cols]:
+                if [w for w in rline.words if is_amount_word(w) and text_cols]:
                     break
                 run_end += 1
             nxt = seg[run_end] if run_end < len(seg) else None
@@ -664,7 +672,7 @@ def _rows_from_columns(
             if wi in used:
                 continue
             text = w.text
-            if is_money_like(text) and w.x1 >= first_num_x0 - 3 and right_cols:
+            if is_amount_word(w) and right_cols:
                 col = min(right_cols, key=lambda c: abs(w.x1 - c.x1))
                 if col.role in NUMERIC_ROLES:
                     put(cells, col, _fix_ocr_number(text) if ocr else text)

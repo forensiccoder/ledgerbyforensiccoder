@@ -16,6 +16,7 @@ type Transaction = {
   reference: string;
   amount: number;
   source: string;
+  unnamed?: boolean; // no counterparty could be read; beneficiary holds the kind of row instead
 };
 
 type ParsedFile = {
@@ -87,6 +88,7 @@ async function analyzeFile(file: File, password?: string): Promise<ParsedFile> {
     transactions: data.transactions.map((t) => ({
       id: t.id, date: t.date, dateIso: t.dateIso, category: t.category, direction: t.direction,
       // An "Other" row has no counterparty the parser could name; show what kind of row it is instead.
+      unnamed: t.category === "Other" && t.beneficiary === "Review narration",
       beneficiary: t.category === "Other" && t.beneficiary === "Review narration" ? (t.channel || "Unclassified") : t.beneficiary, narration: t.narration, reference: t.reference || "—",
       amount: t.amount, source: t.source,
     })),
@@ -130,7 +132,7 @@ export default function Home() {
   const counterpartyOptions = useMemo(() => {
     const counts = new Map<string, number>();
     for (const transaction of targetTransactions) {
-      if (transaction.category === "Other") continue;
+      if (transaction.unnamed) continue;
       const name = transaction.beneficiary;
       if (name === "Cash deposit" || name === "Cash withdrawal" || name === "Review narration") continue;
       counts.set(name, (counts.get(name) ?? 0) + 1);
