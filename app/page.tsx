@@ -2,7 +2,7 @@
 
 import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
 
-type Category = "Cash deposit" | "Cash withdrawal" | "NEFT" | "UPI" | "Other";
+type Category = "Cash deposit" | "Cash withdrawal" | "NEFT" | "UPI" | "IMPS" | "Other";
 type Direction = "Credit" | "Debit" | "Unknown";
 
 type Transaction = {
@@ -24,12 +24,13 @@ type ParsedFile = {
   unclassified: number;
 };
 
-const TARGET_CATEGORIES: Category[] = ["Cash deposit", "Cash withdrawal", "NEFT", "UPI"];
+const TARGET_CATEGORIES: Category[] = ["Cash deposit", "Cash withdrawal", "NEFT", "UPI", "IMPS"];
 const categoryClass: Record<Category, string> = {
   "Cash deposit": "deposit",
   "Cash withdrawal": "withdrawal",
   NEFT: "neft",
   UPI: "upi",
+  IMPS: "imps",
   Other: "other",
 };
 
@@ -227,25 +228,12 @@ export default function Home() {
 
         <div className="summary-grid">
           {totals.map((total) => <button key={total.category} className={`summary-card ${categoryClass[total.category]} ${activeCategory === total.category ? "active" : ""}`} onClick={() => selectCategory(activeCategory === total.category ? "All" : total.category)} type="button"><span>{total.category}</span><strong>{total.count.toLocaleString("en-IN")}</strong><small className={total.amount < 0 ? "debit" : "credit"}>{formatNet(total.amount)} net</small></button>)}
-          <div className={`summary-card counterparty ${activeCounterparty !== "All" ? "active" : ""}`}>
-            <span>Counterparty</span>
-            <select
-              value={activeCounterparty}
-              onChange={(event) => setActiveCounterparty(event.target.value)}
-              disabled={!counterpartyOptions.length}
-              aria-label="Filter by counterparty"
-            >
-              <option value="All">All counterparties</option>
-              {counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}
-            </select>
-            <small>{counterpartyOptions.length ? `${counterpartyOptions.length} identified` : "Upload a statement"}</small>
-          </div>
         </div>
 
         <div className="table-card">
           <div className="table-toolbar">
             <div><span className="section-kicker">Categorised activity</span><h3>{fileName ? fileName : "Upload a statement to begin"}</h3></div>
-            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label><button className="button export" type="button" onClick={() => void exportWorkbook()} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
+            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label><select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><button className="button export" type="button" onClick={() => void exportWorkbook()} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
           </div>
           <div className="filters" aria-label="Transaction category filters"><button className={activeCategory === "All" ? "selected" : ""} onClick={() => selectCategory("All")} type="button">All detected <b>{targetTransactions.length}</b></button>{totals.map((total) => <button key={total.category} className={activeCategory === total.category ? "selected" : ""} onClick={() => selectCategory(total.category)} type="button">{total.category} <b>{total.count}</b></button>)}</div>
           <div className="table-wrap">

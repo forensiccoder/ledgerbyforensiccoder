@@ -27,7 +27,7 @@ TEMPLATES = [
     ("UPI-SWIGGY-SWIGGY.PAYU@ICICI-ICIC0DC0099-{rrn}-PAYMENT FOR ORDER 998877 THROUGH APP", "Debit", "549.50", "UPI", "SWIGGY", "{rrn}"),
     ("NEFT DR-UTIB0000001-JOHN DOE-NETBANK, MUM-UTIBN52024040612345678-RENT APRIL", "Debit", "30000.00", "NEFT", "JOHN DOE", "UTIBN52024040612345678"),
     ("NEFT CHARGES INCL GST", "Debit", "5.90", "Other", "", ""),
-    ("IMPS-{rrn}-PRIYA-HDFC-XXXX", "Debit", "1000.00", "Other", "", ""),
+    ("IMPS-{rrn}-PRIYA-HDFC-XXXX", "Debit", "1000.00", "IMPS", "PRIYA", "{rrn}"),
     ("CDM DEP-ANDHERI EAST", "Credit", "49000.00", "Cash deposit", "", ""),
     ("UPI/CR/{rrn}/ANITA SHARMA/HDFC/anita@ybl/UPI", "Credit", "2500.00", "UPI", "ANITA SHARMA", "{rrn}"),
     ("ATM ANNUAL FEE", "Debit", "295.00", "Other", "", ""),

@@ -26,8 +26,9 @@ CASH_DEPOSIT = "Cash deposit"
 CASH_WITHDRAWAL = "Cash withdrawal"
 NEFT = "NEFT"
 UPI = "UPI"
+IMPS = "IMPS"
 OTHER = "Other"
-TARGET_CATEGORIES = (CASH_DEPOSIT, CASH_WITHDRAWAL, NEFT, UPI)
+TARGET_CATEGORIES = (CASH_DEPOSIT, CASH_WITHDRAWAL, NEFT, UPI, IMPS)
 
 BANK_CODES = frozenset(
     "SBIN HDFC ICIC UTIB KKBK PUNB BARB CNRB IDIB YESB INDB IBKL UBIN BKID MAHB IOBA UCBA CBIN "
@@ -264,6 +265,7 @@ def _decompose(text: str) -> _Parts:
 _UPI_WORD = re.compile(r"(?<![A-Z0-9])UPI(?![A-Z0-9])|(?<![A-Z0-9])UPIAR(?![A-Z0-9])", re.I)
 _NEFT_WORD = re.compile(r"(?<![A-Z0-9])NEFT(?![A-Z0-9])", re.I)
 _RTGS_WORD = re.compile(r"(?<![A-Z0-9])RTGS(?![A-Z0-9])", re.I)
+_IMPS_WORD = re.compile(r"(?<![A-Z0-9])IMPS(?![A-Z0-9])", re.I)
 _FEE = re.compile(
     r"\b(?:chg|chgs|chrg|chrgs|charge|charges|fee|fees|commission|comm|gst|cgst|sgst|igst|amc|"
     r"penalty|penal|service\s+tax|min(?:imum)?\s+bal(?:ance)?|non[\s-]?maint\w*|maintenance)\b",
@@ -293,7 +295,6 @@ _REF_LABELLED = re.compile(
     re.I,
 )
 _OTHER_CHANNELS = (
-    ("IMPS", re.compile(r"(?<![A-Z0-9])IMPS(?![A-Z0-9])", re.I)),
     ("RTGS", _RTGS_WORD),
     ("ECS/NACH", re.compile(r"\b(?:ECS|NACH|ACH)\b", re.I)),
     ("Cheque", _CHEQUE_OR_CLEARING_WORD),
@@ -378,6 +379,19 @@ def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo
     if _RTGS_WORD.search(text):
         info.channel = "RTGS"
         info.reference = parts.utr or parts.number or parts.rrn or _generic_reference(text)
+        return info
+
+    # 3.6. IMPS - an interbank transfer like NEFT, just settled instantly rather than in a batch,
+    # so it gets the same treatment (its own target category with a counterparty/reference) rather
+    # than being left in "Other".
+    if _IMPS_WORD.search(text):
+        info.category = IMPS
+        info.channel = "IMPS"
+        _apply_parts(info, parts, parts.rrn or parts.utr or parts.number or _generic_reference(text))
+        info.counterparty = parts.name or parts.vpa
+        info.confidence = "high" if parts.name and info.reference else "medium"
+        if not parts.name:
+            info.flags.append("counterparty_not_found")
         return info
 
     # 4. Cash deposit / withdrawal
