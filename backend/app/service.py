@@ -67,7 +67,7 @@ def to_dataframe(txns: list[Transaction]) -> pd.DataFrame:
 def summarise(df: pd.DataFrame) -> dict:
     """Per-category counts and exact (Decimal) totals, plus what fell outside the four categories."""
     by_category = {}
-    for category in TARGET_CATEGORIES:
+    for category in (*TARGET_CATEGORIES, OTHER):
         sub = df[df["category"] == category] if len(df) else df
         by_category[category] = {
             "count": int(len(sub)),
@@ -152,13 +152,12 @@ def analyze(data: bytes, filename: str, password: str | None = None, ocr_mode: s
             "Balances do not fully reconcile - some rows may be missing or misread. "
             "Review the flagged rows against the original statement."
         )
-    targets = [t for t in txns if t.category in TARGET_CATEGORIES]
     return {
         "fileName": filename,
         "extraction": {"method": extracted.method, "pages": extracted.pages, "ocrPages": extracted.ocr_pages},
         "statementPeriod": {"from": min(dates).isoformat(), "to": max(dates).isoformat()},
         "totalRows": len(txns),
-        "transactions": [txn_to_api(t) for t in targets],
+        "transactions": [txn_to_api(t) for t in txns],
         "summary": summary,
         "reconciliation": reconciliation_to_api(rec),
         "warnings": warnings,

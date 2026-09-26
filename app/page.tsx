@@ -24,7 +24,8 @@ type ParsedFile = {
   unclassified: number;
 };
 
-const TARGET_CATEGORIES: Category[] = ["Cash deposit", "Cash withdrawal", "NEFT", "UPI", "IMPS"];
+// The five categories the review is about, plus "Other" for everything the classifier left alone.
+const TARGET_CATEGORIES: Category[] = ["Cash deposit", "Cash withdrawal", "NEFT", "UPI", "IMPS", "Other"];
 const categoryClass: Record<Category, string> = {
   "Cash deposit": "deposit",
   "Cash withdrawal": "withdrawal",
@@ -48,7 +49,7 @@ const API_BASE = (process.env.NEXT_PUBLIC_LEDGERLENS_API_URL ?? "http://localhos
 
 type ApiTransaction = {
   id: string; date: string; dateIso: string; category: Category; direction: Direction;
-  beneficiary: string; reference: string; narration: string; amount: number; source: string;
+  beneficiary: string; reference: string; narration: string; amount: number; source: string; channel?: string;
 };
 
 type ApiError = { code: string; message: string };
@@ -85,7 +86,8 @@ async function analyzeFile(file: File, password?: string): Promise<ParsedFile> {
   return {
     transactions: data.transactions.map((t) => ({
       id: t.id, date: t.date, dateIso: t.dateIso, category: t.category, direction: t.direction,
-      beneficiary: t.beneficiary, narration: t.narration, reference: t.reference || "—",
+      // An "Other" row has no counterparty the parser could name; show what kind of row it is instead.
+      beneficiary: t.category === "Other" && t.beneficiary === "Review narration" ? (t.channel || "Unclassified") : t.beneficiary, narration: t.narration, reference: t.reference || "—",
       amount: t.amount, source: t.source,
     })),
     totalRows: data.totalRows,
@@ -128,6 +130,7 @@ export default function Home() {
   const counterpartyOptions = useMemo(() => {
     const counts = new Map<string, number>();
     for (const transaction of targetTransactions) {
+      if (transaction.category === "Other") continue;
       const name = transaction.beneficiary;
       if (name === "Cash deposit" || name === "Cash withdrawal" || name === "Review narration") continue;
       counts.set(name, (counts.get(name) ?? 0) + 1);
@@ -163,8 +166,8 @@ export default function Home() {
       // start every newly loaded statement with a clean, unfiltered view.
       setActiveCategory("All"); setActiveCounterparty("All"); setSearch(""); setMaterialityInput(""); setMaterialityOpen(false);
       setStatus("ready");
-      const detected = parsed.transactions.length;
-      setMessage(`${detected} target transactions detected from ${parsed.totalRows} statement rows. ${parsed.unclassified ? `${parsed.unclassified} non-target rows were kept out of the review list.` : ""}`);
+      const detected = parsed.transactions.length - parsed.unclassified;
+      setMessage(`${detected} target transactions detected from ${parsed.totalRows} statement rows.${parsed.unclassified ? ` ${parsed.unclassified} other transactions are listed under Other.` : ""}`);
     } catch (error) {
       // Password-protected PDFs get a second chance: prompt once and retry with what's typed.
       // A blank/cancelled prompt is treated as giving up rather than looping forever.
@@ -259,7 +262,7 @@ export default function Home() {
             <div><span className="section-kicker">Categorised activity</span><h3>{fileName ? fileName : "Upload a statement to begin"}</h3></div>
             <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label><select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><div className="materiality"><button className={`button materiality-toggle ${materialityAmount !== null ? "active" : ""}`} type="button" onClick={() => setMaterialityOpen((open) => !open)} aria-expanded={materialityOpen} aria-haspopup="dialog" disabled={!targetTransactions.length}>Materiality{materialityAmount !== null ? `: ${materialityMode === "above" ? "≥" : "≤"} ${formatAmount(materialityAmount)}` : ""}</button>{materialityOpen && <div className="materiality-panel" role="dialog" aria-label="Materiality filter"><label>Show transactions<select value={materialityMode} onChange={(event) => setMaterialityMode(event.target.value as "above" | "below")}><option value="above">at or above</option><option value="below">at or below</option></select></label><label>Amount (₹)<input inputMode="decimal" value={materialityInput} onChange={(event) => setMaterialityInput(event.target.value)} placeholder="e.g. 50000" autoFocus /></label><div className="materiality-actions"><button className="button" type="button" onClick={() => setMaterialityInput("")} disabled={!materialityInput}>Clear</button><button className="button button-dark" type="button" onClick={() => setMaterialityOpen(false)}>Done</button></div></div>}</div><button className="button export" type="button" onClick={() => void exportWorkbook()} title={activeCategory === "All" ? "Export every category" : `Export only ${activeCategory}`} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
           </div>
-          <div className="filters" aria-label="Transaction category filters"><button className={activeCategory === "All" ? "selected" : ""} onClick={() => selectCategory("All")} type="button">All detected <b>{targetTransactions.length}</b></button>{totals.map((total) => <button key={total.category} className={activeCategory === total.category ? "selected" : ""} onClick={() => selectCategory(total.category)} type="button">{total.category} <b>{total.count}</b></button>)}</div>
+          <div className="filters" aria-label="Transaction category filters"><button className={activeCategory === "All" ? "selected" : ""} onClick={() => selectCategory("All")} type="button">All transactions <b>{targetTransactions.length}</b></button>{totals.map((total) => <button key={total.category} className={activeCategory === total.category ? "selected" : ""} onClick={() => selectCategory(total.category)} type="button">{total.category} <b>{total.count}</b></button>)}</div>
           <div className="table-wrap">
             {filtered.length ? <table><thead><tr><th>Transaction date</th><th>Category</th><th>Beneficiary / payer</th><th>Reference</th><th>Narration</th><th className="amount">Amount</th></tr></thead><tbody>{filtered.map((transaction) => <tr key={transaction.id}><td className="date-cell">{transaction.date}<small className={directionClass(transaction.direction)}>{transaction.direction}</small></td><td><span className={`tag ${categoryClass[transaction.category]}`}>{transaction.category}</span></td><td className="beneficiary">{transaction.beneficiary}</td><td className="reference">{transaction.reference}</td><td className="narration">{transaction.narration}</td><td className={`amount ${directionClass(transaction.direction)}`}>{signedAmount(transaction.direction, transaction.amount)}</td></tr>)}</tbody></table> : <div className="empty-state"><div>⌁</div><strong>{status === "ready" ? "No matching activity" : "Your forensic review starts here"}</strong><p>{status === "ready" ? "Try another category or search phrase." : "Upload a statement to extract cash deposits, cash withdrawals, NEFT and UPI transactions."}</p></div>}
           </div>

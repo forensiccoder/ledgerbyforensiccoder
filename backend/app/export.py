@@ -39,7 +39,8 @@ def _sanitise(value: object) -> object:
 
 
 def _rows_for(transactions: list[dict], category: str | None) -> list[dict]:
-    items = [t for t in transactions if category is None or t["category"] == category]
+    # The workbook/CSV cover the target categories only; miscellaneous ("Other") rows stay on screen.
+    items = [t for t in transactions if (t["category"] == category if category else t["category"] in TARGET_CATEGORIES)]
     out = []
     for t in items:
         out.append({
