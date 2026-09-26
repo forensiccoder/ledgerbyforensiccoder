@@ -181,8 +181,18 @@ export default function Home() {
 
   const exportWorkbook = async () => {
     if (!targetTransactions.length) return;
-    const XLSX = await import("xlsx");
+    const XLSX = await import("xlsx-js-style");
     const workbook = XLSX.utils.book_new();
+    // json_to_sheet + a bold header row (the first row of every sheet holds the column headers).
+    const toSheet = (rows: Record<string, unknown>[]) => {
+      const sheet = XLSX.utils.json_to_sheet(rows);
+      const range = XLSX.utils.decode_range(sheet["!ref"] ?? "A1");
+      for (let col = range.s.c; col <= range.e.c; col++) {
+        const cell = sheet[XLSX.utils.encode_cell({ r: range.s.r, c: col })];
+        if (cell) cell.s = { font: { bold: true } };
+      }
+      return sheet;
+    };
     const rowsFor = (items: Transaction[]) => items.map((transaction) => ({
       "Transaction date": transaction.date,
       "Category": transaction.category,
@@ -197,13 +207,13 @@ export default function Home() {
     if (activeCategory !== "All") {
       // A category is selected: export just that category - exactly the rows on screen, so the
       // counterparty / materiality / search filters applied to it carry into the file.
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rowsFor(filtered)), activeCategory.slice(0, 31));
+      XLSX.utils.book_append_sheet(workbook, toSheet(rowsFor(filtered)), activeCategory.slice(0, 31));
       XLSX.writeFile(workbook, `ledgerlens-${activeCategory.toLowerCase().replace(/\s+/g, "-")}-${stamp}.xlsx`, { compression: true });
       return;
     }
-    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(totals.map((total) => ({ Category: total.category, Transactions: total.count, "Net amount (INR)": total.amount }))), "Summary");
+    XLSX.utils.book_append_sheet(workbook, toSheet(totals.map((total) => ({ Category: total.category, Transactions: total.count, "Net amount (INR)": total.amount }))), "Summary");
     TARGET_CATEGORIES.forEach((category) => {
-      const sheet = XLSX.utils.json_to_sheet(rowsFor(targetTransactions.filter((transaction) => transaction.category === category)));
+      const sheet = toSheet(rowsFor(targetTransactions.filter((transaction) => transaction.category === category)));
       XLSX.utils.book_append_sheet(workbook, sheet, category.slice(0, 31));
     });
     XLSX.writeFile(workbook, `ledgerlens-category-review-${stamp}.xlsx`, { compression: true });
