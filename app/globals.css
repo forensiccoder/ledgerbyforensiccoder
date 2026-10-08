@@ -69,3 +69,11 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .phone-filter { width: 170px; }
 .phone-cell { font-variant-numeric: tabular-nums; white-space: nowrap; color: #444; font-size: 12px; }
 @media (max-width: 760px) { .phone-filter { width: 100%; } }
+.export-group { position: relative; display: flex; }
+.export-group .export-caret { margin-left: 1px; padding: 0 9px; }
+.export-group .export-caret span { margin: 0; }
+.export-menu { position: absolute; right: 0; top: 44px; z-index: 30; min-width: 160px; display: grid; border: 1px solid var(--ink); background: var(--paper); box-shadow: 0 8px 24px rgba(0,0,0,.14); }
+.export-menu button { padding: 10px 14px; border: 0; background: transparent; color: var(--ink); font-size: 13px; text-align: left; cursor: pointer; }
+.export-menu button:hover { background: var(--amber); }
+.export-menu button + button { border-top: 1px solid var(--line); }
+@media (max-width: 760px) { .export-menu { left: 0; right: auto; } }
