@@ -16,7 +16,19 @@ type Transaction = {
   reference: string;
   amount: number;
   source: string;
+  statementId?: string; // which uploaded statement the row came from
   unnamed?: boolean; // no counterparty could be read; beneficiary holds the kind of row instead
+};
+
+type StatementEntry = {
+  id: string;
+  name: string;
+  signature: string; // name + size + modified time, to recognise the same file chosen twice
+  status: "processing" | "ready" | "error";
+  message: string;
+  transactions: Transaction[];
+  totalRows: number;
+  unclassified: number;
 };
 
 type ParsedFile = {
@@ -106,10 +118,9 @@ function formatNet(amount: number) { return `${amount < 0 ? "−" : "+"}${format
 
 export default function Home() {
   const fileInput = useRef<HTMLInputElement>(null);
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [fileName, setFileName] = useState("");
-  const [status, setStatus] = useState<"idle" | "processing" | "ready" | "error">("idle");
-  const [message, setMessage] = useState("");
+  const [statements, setStatements] = useState<StatementEntry[]>([]);
+  const [activeStatement, setActiveStatement] = useState("All");
+  const nextStatementId = useRef(1);
   const [activeCategory, setActiveCategory] = useState<Category | "All">("All");
   const [activeCounterparty, setActiveCounterparty] = useState("All");
   const [search, setSearch] = useState("");
@@ -124,6 +135,25 @@ export default function Home() {
   // combine (AND logic) and can silently show zero rows for a category that plainly has matches,
   // just because the previously selected counterparty doesn't happen to appear in it.
   const selectCategory = (category: Category | "All") => { setActiveCategory(category); setActiveCounterparty("All"); };
+
+  // Every statement that has been read, merged into one list. Row ids are only unique within a
+  // statement, so they are prefixed with the statement's own id here.
+  const transactions = useMemo(() => statements.flatMap((statement) => statement.transactions.map((transaction) => ({ ...transaction, id: `${statement.id}:${transaction.id}`, statementId: statement.id }))), [statements]);
+  const status: "idle" | "processing" | "ready" | "error" = !statements.length ? "idle" : statements.some((statement) => statement.status === "processing") ? "processing" : statements.some((statement) => statement.status === "ready") ? "ready" : "error";
+  const multiple = statements.length > 1;
+  const readyStatements = statements.filter((statement) => statement.status === "ready");
+  const fileName = statements.length === 1 ? statements[0].name : statements.length ? `${statements.length} statements combined` : "";
+  const message = (() => {
+    if (!statements.length) return "";
+    const failed = statements.filter((statement) => statement.status === "error");
+    if (status === "processing") { const done = statements.filter((statement) => statement.status !== "processing").length; return `Reading statement ${done + 1} of ${statements.length}…`; }
+    const rows = readyStatements.reduce((sum, statement) => sum + statement.totalRows, 0);
+    const other = readyStatements.reduce((sum, statement) => sum + statement.unclassified, 0);
+    const detected = readyStatements.reduce((sum, statement) => sum + statement.transactions.length - statement.unclassified, 0);
+    const failure = failed.length ? ` ${failed.length === 1 ? failed[0].message : `${failed.length} files could not be read.`}` : "";
+    if (!readyStatements.length) return failed[0]?.message ?? "We could not read that file.";
+    return `${detected} target transactions detected from ${rows} statement rows${multiple ? ` across ${readyStatements.length} statements` : ""}.${other ? ` ${other} other transactions are listed under Other.` : ""}${failure}`;
+  })();
 
   const targetTransactions = useMemo(() => transactions.filter((transaction) => TARGET_CATEGORIES.includes(transaction.category)), [transactions]);
   // "Cash deposit" / "Cash withdrawal" / "Review narration" are display_counterparty()'s own
@@ -143,10 +173,11 @@ export default function Home() {
   const filtered = useMemo(() => targetTransactions.filter((transaction) => {
     const categoryMatches = activeCategory === "All" || transaction.category === activeCategory;
     const counterpartyMatches = activeCounterparty === "All" || transaction.beneficiary === activeCounterparty;
+    const statementMatches = activeStatement === "All" || transaction.statementId === activeStatement;
     const searchText = `${transaction.beneficiary} ${transaction.narration} ${transaction.reference}`.toLowerCase();
     const materialityMatches = materialityAmount === null || (materialityMode === "above" ? transaction.amount >= materialityAmount : transaction.amount <= materialityAmount);
-    return categoryMatches && counterpartyMatches && materialityMatches && searchText.includes(search.trim().toLowerCase());
-  }).sort((a, b) => a.dateIso.localeCompare(b.dateIso)), [targetTransactions, activeCategory, activeCounterparty, search, materialityMode, materialityAmount]);
+    return categoryMatches && counterpartyMatches && statementMatches && materialityMatches && searchText.includes(search.trim().toLowerCase());
+  }).sort((a, b) => a.dateIso.localeCompare(b.dateIso)), [targetTransactions, activeCategory, activeCounterparty, activeStatement, search, materialityMode, materialityAmount]);
 
   // Net, not gross: a category like NEFT or UPI can hold both incoming and outgoing transactions,
   // so summing every amount as positive would overstate what actually moved. Cash deposit/
@@ -157,32 +188,50 @@ export default function Home() {
     return { category, count: matches.length, amount: net };
   }), [targetTransactions]);
 
-  const handleUpload = async (file?: File, password?: string) => {
-    if (!file) return;
-    setStatus("processing"); setMessage(""); setFileName(file.name);
+  const patchStatement = (id: string, patch: Partial<StatementEntry>) => setStatements((current) => current.map((statement) => (statement.id === id ? { ...statement, ...patch } : statement)));
+
+  // Read one file into its own entry. Password-protected PDFs get a second chance: prompt once and
+  // retry with what's typed. A blank/cancelled prompt is treated as giving up rather than looping.
+  const readStatement = async (id: string, file: File, password?: string): Promise<void> => {
     try {
       const parsed = await analyzeFile(file, password);
-      setTransactions(parsed.transactions);
-      // A filter left over from a previously loaded statement (a category, a counterparty, a
-      // search term) can silently hide everything in a new one if it doesn't happen to match -
-      // start every newly loaded statement with a clean, unfiltered view.
-      setActiveCategory("All"); setActiveCounterparty("All"); setSearch(""); setMaterialityInput(""); setMaterialityOpen(false);
-      setStatus("ready");
-      const detected = parsed.transactions.length - parsed.unclassified;
-      setMessage(`${detected} target transactions detected from ${parsed.totalRows} statement rows.${parsed.unclassified ? ` ${parsed.unclassified} other transactions are listed under Other.` : ""}`);
+      patchStatement(id, { status: "ready", message: "", transactions: parsed.transactions, totalRows: parsed.totalRows, unclassified: parsed.unclassified });
     } catch (error) {
-      // Password-protected PDFs get a second chance: prompt once and retry with what's typed.
-      // A blank/cancelled prompt is treated as giving up rather than looping forever.
       if (error instanceof StatementApiError && (error.code === "PASSWORD_REQUIRED" || error.code === "WRONG_PASSWORD")) {
-        const entered = window.prompt(error.code === "WRONG_PASSWORD" ? "That password was incorrect. Try again:" : "This PDF is password-protected. Enter the password:");
-        if (entered) { void handleUpload(file, entered); return; }
+        const entered = window.prompt(`${file.name}: ${error.code === "WRONG_PASSWORD" ? "that password was incorrect. Try again:" : "this PDF is password-protected. Enter the password:"}`);
+        if (entered) return readStatement(id, file, entered);
       }
-      setTransactions([]); setStatus("error"); setMessage(error instanceof Error ? error.message : "We could not read that file.");
+      patchStatement(id, { status: "error", message: error instanceof Error ? error.message : "We could not read that file." });
     }
   };
 
-  const onInput = (event: ChangeEvent<HTMLInputElement>) => { void handleUpload(event.target.files?.[0]); event.target.value = ""; };
-  const onDrop = (event: DragEvent<HTMLDivElement>) => { event.preventDefault(); setDragging(false); void handleUpload(event.dataTransfer.files?.[0]); };
+  // Uploading adds to what is already loaded (use Clear all to start over). Files are read one at a
+  // time: a scanned statement is OCR'd page by page, and several at once would only slow each other.
+  const handleFiles = async (incoming?: FileList | File[] | null) => {
+    const files = Array.from(incoming ?? []);
+    if (!files.length) return;
+    const known = new Set(statements.map((statement) => statement.signature));
+    const fresh = files.filter((file) => { const signature = `${file.name}|${file.size}|${file.lastModified}`; if (known.has(signature)) return false; known.add(signature); return true; });
+    if (!fresh.length) return;
+    const entries: { entry: StatementEntry; file: File }[] = fresh.map((file) => ({
+      file,
+      entry: { id: `s${nextStatementId.current++}`, name: file.name, signature: `${file.name}|${file.size}|${file.lastModified}`, status: "processing", message: "", transactions: [], totalRows: 0, unclassified: 0 },
+    }));
+    setStatements((current) => [...current, ...entries.map(({ entry }) => entry)]);
+    // The counterparty list changes with the data; start it fresh so a stale pick cannot hide everything.
+    setActiveCounterparty("All"); setMaterialityOpen(false);
+    for (const { entry, file } of entries) await readStatement(entry.id, file);
+  };
+
+  const removeStatement = (id: string) => {
+    setStatements((current) => current.filter((statement) => statement.id !== id));
+    setActiveCounterparty("All");
+    if (activeStatement === id) setActiveStatement("All");
+  };
+  const clearStatements = () => { setStatements([]); setActiveStatement("All"); setActiveCategory("All"); setActiveCounterparty("All"); setSearch(""); setMaterialityInput(""); setMaterialityOpen(false); };
+
+  const onInput = (event: ChangeEvent<HTMLInputElement>) => { void handleFiles(event.target.files); event.target.value = ""; };
+  const onDrop = (event: DragEvent<HTMLDivElement>) => { event.preventDefault(); setDragging(false); void handleFiles(event.dataTransfer.files); };
 
   const exportWorkbook = async () => {
     if (!targetTransactions.length) return;
@@ -249,10 +298,11 @@ export default function Home() {
           onDrop={onDrop}
         >
           <div className="upload-icon">↑</div>
-          <div><strong>{status === "processing" ? "Reading your statement…" : "Drop a bank statement here"}</strong><span>or choose a PDF, CSV, XLSX or XLS file</span></div>
-          <button className="button button-dark" type="button" onClick={() => fileInput.current?.click()} disabled={status === "processing"}>{status === "processing" ? "Analysing" : "Select statement"}</button>
-          <input ref={fileInput} type="file" accept=".pdf,.csv,.xlsx,.xls,application/pdf,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={onInput} />
+          <div><strong>{status === "processing" ? "Reading your statements…" : statements.length ? "Drop more statements to add them" : "Drop bank statements here"}</strong><span>or choose one or more PDF, CSV, XLSX or XLS files</span></div>
+          <button className="button button-dark" type="button" onClick={() => fileInput.current?.click()} disabled={status === "processing"}>{status === "processing" ? "Analysing" : statements.length ? "Add statements" : "Select statements"}</button>
+          <input ref={fileInput} type="file" multiple accept=".pdf,.csv,.xlsx,.xls,application/pdf,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={onInput} />
         </div>
+        {statements.length > 0 && <div className="statement-list" aria-label="Uploaded statements">{statements.map((statement) => <span key={statement.id} className={`statement-chip ${statement.status}`} title={statement.message || statement.name}><b>{statement.status === "processing" ? "…" : statement.status === "error" ? "!" : "✓"}</b><span className="statement-name">{statement.name}</span>{statement.status === "ready" && <small>{statement.transactions.length.toLocaleString("en-IN")}</small>}<button type="button" onClick={() => removeStatement(statement.id)} aria-label={`Remove ${statement.name}`}>×</button></span>)}{statements.length > 1 && <button className="statement-clear" type="button" onClick={clearStatements}>Clear all</button>}</div>}
         <div className={`privacy-line ${status === "error" ? "error" : ""}`}><span>{status === "error" ? "!" : "✓"}</span>{message || "Statements are sent to the LedgerLens analysis service for extraction. Scanned PDFs are OCR'd automatically."}</div>
 
         <div className="summary-grid">
@@ -261,12 +311,12 @@ export default function Home() {
 
         <div className="table-card">
           <div className="table-toolbar">
-            <div><span className="section-kicker">Categorised activity</span><h3>{fileName ? fileName : "Upload a statement to begin"}</h3></div>
-            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label><select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><div className="materiality"><button className={`button materiality-toggle ${materialityAmount !== null ? "active" : ""}`} type="button" onClick={() => setMaterialityOpen((open) => !open)} aria-expanded={materialityOpen} aria-haspopup="dialog" disabled={!targetTransactions.length}>Materiality{materialityAmount !== null ? `: ${materialityMode === "above" ? "≥" : "≤"} ${formatAmount(materialityAmount)}` : ""}</button>{materialityOpen && <div className="materiality-panel" role="dialog" aria-label="Materiality filter"><label>Show transactions<select value={materialityMode} onChange={(event) => setMaterialityMode(event.target.value as "above" | "below")}><option value="above">at or above</option><option value="below">at or below</option></select></label><label>Amount (₹)<input inputMode="decimal" value={materialityInput} onChange={(event) => setMaterialityInput(event.target.value)} placeholder="e.g. 50000" autoFocus /></label><div className="materiality-actions"><button className="button" type="button" onClick={() => setMaterialityInput("")} disabled={!materialityInput}>Clear</button><button className="button button-dark" type="button" onClick={() => setMaterialityOpen(false)}>Done</button></div></div>}</div><button className="button export" type="button" onClick={() => void exportWorkbook()} title={activeCategory === "All" ? "Export every category" : `Export only ${activeCategory}`} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
+            <div><span className="section-kicker">Categorised activity</span><h3>{fileName ? fileName : "Upload statements to begin"}</h3></div>
+            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label>{multiple && <select className="counterparty-filter" value={activeStatement} onChange={(event) => setActiveStatement(event.target.value)} aria-label="Filter by statement"><option value="All">All statements</option>{readyStatements.map((statement) => <option key={statement.id} value={statement.id}>{statement.name}</option>)}</select>}<select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><div className="materiality"><button className={`button materiality-toggle ${materialityAmount !== null ? "active" : ""}`} type="button" onClick={() => setMaterialityOpen((open) => !open)} aria-expanded={materialityOpen} aria-haspopup="dialog" disabled={!targetTransactions.length}>Materiality{materialityAmount !== null ? `: ${materialityMode === "above" ? "≥" : "≤"} ${formatAmount(materialityAmount)}` : ""}</button>{materialityOpen && <div className="materiality-panel" role="dialog" aria-label="Materiality filter"><label>Show transactions<select value={materialityMode} onChange={(event) => setMaterialityMode(event.target.value as "above" | "below")}><option value="above">at or above</option><option value="below">at or below</option></select></label><label>Amount (₹)<input inputMode="decimal" value={materialityInput} onChange={(event) => setMaterialityInput(event.target.value)} placeholder="e.g. 50000" autoFocus /></label><div className="materiality-actions"><button className="button" type="button" onClick={() => setMaterialityInput("")} disabled={!materialityInput}>Clear</button><button className="button button-dark" type="button" onClick={() => setMaterialityOpen(false)}>Done</button></div></div>}</div><button className="button export" type="button" onClick={() => void exportWorkbook()} title={activeCategory === "All" ? "Export every category" : `Export only ${activeCategory}`} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
           </div>
           <div className="filters" aria-label="Transaction category filters"><button className={activeCategory === "All" ? "selected" : ""} onClick={() => selectCategory("All")} type="button">All transactions <b>{targetTransactions.length}</b></button>{totals.map((total) => <button key={total.category} className={activeCategory === total.category ? "selected" : ""} onClick={() => selectCategory(total.category)} type="button">{total.category} <b>{total.count}</b></button>)}</div>
           <div className="table-wrap">
-            {filtered.length ? <table><thead><tr><th>Transaction date</th><th>Category</th><th>Beneficiary / payer</th><th>Reference</th><th>Narration</th><th className="amount">Amount</th></tr></thead><tbody>{filtered.map((transaction) => <tr key={transaction.id}><td className="date-cell">{transaction.date}<small className={directionClass(transaction.direction)}>{transaction.direction}</small></td><td><span className={`tag ${categoryClass[transaction.category]}`}>{transaction.category}</span></td><td className="beneficiary">{transaction.beneficiary}</td><td className="reference">{transaction.reference}</td><td className="narration">{transaction.narration}</td><td className={`amount ${directionClass(transaction.direction)}`}>{signedAmount(transaction.direction, transaction.amount)}</td></tr>)}</tbody></table> : <div className="empty-state"><div>⌁</div><strong>{status === "ready" ? "No matching activity" : "Your forensic review starts here"}</strong><p>{status === "ready" ? "Try another category or search phrase." : "Upload a statement to extract cash deposits, cash withdrawals, NEFT and UPI transactions."}</p></div>}
+            {filtered.length ? <table><thead><tr><th>Transaction date</th><th>Category</th><th>Beneficiary / payer</th><th>Reference</th><th>Narration</th>{multiple && <th>Statement</th>}<th className="amount">Amount</th></tr></thead><tbody>{filtered.map((transaction) => <tr key={transaction.id}><td className="date-cell">{transaction.date}<small className={directionClass(transaction.direction)}>{transaction.direction}</small></td><td><span className={`tag ${categoryClass[transaction.category]}`}>{transaction.category}</span></td><td className="beneficiary">{transaction.beneficiary}</td><td className="reference">{transaction.reference}</td><td className="narration">{transaction.narration}</td>{multiple && <td className="statement-cell">{statements.find((statement) => statement.id === transaction.statementId)?.name}</td>}<td className={`amount ${directionClass(transaction.direction)}`}>{signedAmount(transaction.direction, transaction.amount)}</td></tr>)}</tbody></table> : <div className="empty-state"><div>⌁</div><strong>{status === "ready" ? "No matching activity" : "Your forensic review starts here"}</strong><p>{status === "ready" ? "Try another category or search phrase." : "Upload statements to extract cash deposits, cash withdrawals, NEFT and UPI transactions."}</p></div>}
           </div>
           <footer className="table-footer"><span>{targetTransactions.length ? `${filtered.length} of ${targetTransactions.length} detected transactions shown` : "No statement loaded"}</span><span>Review beneficiary inference against the original narration before relying on it.</span></footer>
         </div>
