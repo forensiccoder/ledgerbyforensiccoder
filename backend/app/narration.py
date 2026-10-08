@@ -386,12 +386,15 @@ _TPT = re.compile(r"^\s*\d{6,}-TPT-[A-Z]-(.+?)\s*$", re.I)
 _ACH_NAME = re.compile(r"^\s*ACH\s+D-\s*(.+?)(?:-[A-Z]*\d\w*)?\s*$", re.I)
 _RTGS_NAME = re.compile(r"^\s*RTGS\s+(?:CR|DR)-[A-Z]{4}0[A-Z0-9]{6}-(.+?)-", re.I)
 _NAME_THEN_REMARK = re.compile(r"^\s*([A-Za-z][A-Za-z.]*(?: [A-Za-z][A-Za-z.]*){0,4}) -(?=[A-Za-z])")
-_NAME_SEGMENT = re.compile(r"[A-Za-z][A-Za-z .&]*[A-Za-z.]")
+_NAME_SEGMENT = re.compile(r"[A-Za-z][A-Za-z .&()]*[A-Za-z.)]")
 _NOT_NAMES = {"FT", "NACH", "ACH", "TPT", "A2AINT01", "P", "M", "RETURN", "COMMON REDEMPTION A/C"}
 
 
 def _name_segments(text: str) -> list[str]:
     parts = re.split(r"\s+-\s*|-{1,2}", text)
+    # The bank cuts long names at a fixed width, often mid-bracket ("KOGTA FINANCIAL (IND"): the
+    # dangling "(..." is a truncated suffix, not part of the name.
+    parts = [re.sub(r"\s*\([^)]*$", "", p) for p in parts]
     return [p.strip() for p in parts
             if _NAME_SEGMENT.fullmatch(p.strip()) and len(p.strip()) > 3 and p.strip().upper() not in _NOT_NAMES]
 

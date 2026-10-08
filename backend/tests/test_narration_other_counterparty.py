@@ -64,3 +64,8 @@ def test_reference_wider_than_its_header_is_not_mistaken_for_an_amount():
     rows = layout_page(ws, page=1, state=LayoutState(), ocr=False)
     narr_i = rows[0].cells.index("Narration")
     assert "INANCE PRIVATE LIMIT-ASHISH" in rows[1].cells[narr_i]
+
+
+def test_ach_name_cut_off_mid_bracket_drops_the_dangling_suffix():
+    assert _cp("ACH D- KOGTA FINANCIAL (IND-REF000000006")[2] == "KOGTA FINANCIAL"
+    assert _cp("ACH D- BEST CAPITAL SERVICE-319091")[2] == "BEST CAPITAL SERVICE"
