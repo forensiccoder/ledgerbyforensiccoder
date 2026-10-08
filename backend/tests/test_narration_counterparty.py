@@ -31,3 +31,14 @@ def test_repeated_channel_word_around_direction_marker_does_not_steal_the_counte
 def test_leading_direction_word_before_a_name_is_still_stripped():
     info = parse_narration("NEFT CR-SBIN0001234-TO ACME TRADERS-SBINN52024040212345678", direction="Credit")
     assert info.counterparty == "ACME TRADERS"
+
+
+def test_upi_name_glued_to_its_rrn_is_split():
+    from app.narration import parse_narration
+
+    info = parse_narration("UPI-RAM160821698970-PAYMENT FROM PHONE", direction="Credit")
+    assert (info.category, info.counterparty, info.reference) == ("UPI", "RAM", "160821698970")
+    two = parse_narration("UPI-RAM KUMAR160821698970-PAYMENT FROM PHONE", direction="Debit")
+    assert (two.counterparty, two.reference) == ("RAM KUMAR", "160821698970")
+    # a UTR-style reference (letters then digits, as NEFT prints it) is not a name + RRN
+    assert parse_narration("NEFT-N241234567890-ACME TRADERS", direction="Credit").counterparty == "ACME TRADERS"

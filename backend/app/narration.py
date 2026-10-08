@@ -244,9 +244,15 @@ def _assign(parts: _Parts, kind: str, value: str) -> None:
         parts.name = _clean_name(value)
 
 
+# Some banks print a UPI payee's name and the 12-digit RRN with nothing between them
+# ("UPI-RAM160821698970-PAYMENT FROM PHONE"): a name, then exactly 12 digits, ending the field.
+_GLUED_NAME_RRN = re.compile(r"^([A-Za-z][A-Za-z .]*?[A-Za-z])(\d{12})$")
+
+
 def _decompose(text: str) -> _Parts:
     parts = _Parts()
     text = _repair_wrapped_tokens(text)
+    is_upi = bool(_UPI_WORD.search(text))
     # SBI prints "TO TRANSFER-..." / "BY TRANSFER-..." which also tells us the direction.
     m = re.match(r"^\s*(TO|BY)\s+TRANSFER\b[\s:-]*", text, re.I)
     if m:
@@ -261,6 +267,11 @@ def _decompose(text: str) -> _Parts:
                     parts.hint = "Credit"
                 elif re.search(r"\b(DR|DEBIT)\b", marker_text, re.I):
                     parts.hint = "Debit"
+            continue
+        glued = _GLUED_NAME_RRN.match(stripped) if is_upi and "@" not in stripped else None
+        if glued and len(glued.group(1)) >= 2 and not _IFSC.match(glued.group(1).upper()):
+            _assign(parts, "name", glued.group(1))
+            _assign(parts, "rrn", glued.group(2))
             continue
         words = stripped.split()
         if len(words) > 1:
