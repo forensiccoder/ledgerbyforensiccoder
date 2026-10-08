@@ -61,6 +61,7 @@ def _repair_vpa(text: str) -> str:
     characters in the bank suffix ("@ybI:", "@yb!", "@ypbl") - one handle, one spelling."""
     text = re.sub(r"(?<=\w)\s+@(?=[A-Za-z])", "@", text)
     text = re.sub(r"(?<=[A-Za-z]) (?=\d{1,2}@[A-Za-z])", "", text)  # "AIRTELPREDIRECT 1@ybl"
+    text = re.sub(r"(?<=\d{6}) (?=\d{1,2}@[A-Za-z])", "", text)  # "971885784 1@KOTAK"
 
     def fix(m: re.Match[str]) -> str:
         suffix = m.group(1)

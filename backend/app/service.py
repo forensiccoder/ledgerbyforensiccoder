@@ -14,6 +14,7 @@ from .extract import extract_statement
 from .models import Transaction
 from .narration import CASH_DEPOSIT, CASH_WITHDRAWAL, OTHER, TARGET_CATEGORIES, parse_narration
 from .normalize import build_transactions
+from .ocr_cleanup import clean_ocr_narrations
 from .reconcile import Reconciliation, reconcile, repair_from_balances
 
 _ZERO_PAD_REF = re.compile(r"^0+(\d{12})$")
@@ -137,9 +138,12 @@ def analyze(data: bytes, filename: str, password: str | None = None, ocr_mode: s
             "(Date, Narration/Description, Debit/Credit or Amount, Balance)." + hint,
         )
 
+    ocr_read = extracted.method == "ocr" or bool(extracted.ocr_pages)
+    if ocr_read:
+        clean_ocr_narrations(txns)
     for t in txns:
         apply_narration(t)
-    if extracted.method == "ocr" or extracted.ocr_pages:
+    if ocr_read:
         repair_from_balances(txns, normalised.opening_balance)
     rec = reconcile(txns, normalised.opening_balance, normalised.closing_balance)
     for t in txns:  # direction may have changed (balance / narration) -> classify again

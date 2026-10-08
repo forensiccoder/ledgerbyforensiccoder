@@ -392,6 +392,10 @@ def _other_details(narration: str) -> tuple[str, str]:
     m = _TPT.match(text)
     if m:
         return "Transfer (TPT)", m.group(1).strip()
+    # "FT - DR - <account> - NAME" (an in-bank fund transfer), often with the "FT -" lost to OCR.
+    m = re.match(r"^\W*(?:FT\W*)?(?:DR|CR)\W*\d{9,}\W*([A-Za-z][A-Za-z .&]{2,})$", text, re.I)
+    if m:
+        return "Fund transfer", m.group(1).strip()
     m = _ACH_NAME.match(text)
     if m:
         names = _name_segments(m.group(1))

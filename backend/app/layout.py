@@ -494,6 +494,22 @@ def _is_ocr_junk(token: str) -> bool:
     return len(core) <= 4 and not core.isupper()
 
 
+_SYMBOL_FIVE = re.compile(r"^[$S§s](\d{1,2}(?:,?\d{3})*\.\d{2})$")
+
+
+def _fix_symbol_for_five(words: list[Word]) -> list[Word]:
+    """An amount whose leading "5" was read as "$" or "S" ("$48.00" for 548.00). Only in the money
+    columns, only when what follows is a complete amount - never changes a normal figure."""
+    if not words:
+        return words
+    width = max(w.x1 for w in words)
+    out = []
+    for w in words:
+        m = _SYMBOL_FIVE.match(w.text) if w.x0 > 0.45 * width else None
+        out.append(Word("5" + m.group(1), w.x0, w.x1, w.top, w.bottom, w.line_start) if m else w)
+    return out
+
+
 def _merge_split_money(words: list[Word]) -> list[Word]:
     """Rejoin a figure whose decimal point the OCR lost: "5000 00" -> "5000.00", "803 27Cr" ->
     "803.27Cr". Only in the money columns (right of the page's midline), where a whole number
@@ -562,7 +578,7 @@ def plan_ocr_columns(pages: list[list[Word]]) -> list[list[Column] | None]:
     prepared: list[list[Word]] = []
     state_date: date | None = None
     for words in pages:
-        fixed, state_date = _repair_ocr_dates(_merge_split_money(words), state_date)
+        fixed, state_date = _repair_ocr_dates(_fix_symbol_for_five(_merge_split_money(words)), state_date)
         prepared.append(_dewarp(fixed))
     best: tuple[int, list[Column], tuple[float, float]] | None = None
     for words in prepared:
@@ -698,7 +714,7 @@ def layout_page(
     columns_override: list[Column] | None = None,
 ) -> list[RawRow]:
     if ocr:
-        words = _merge_split_money(words)
+        words = _fix_symbol_for_five(_merge_split_money(words))
         words, state.last_date = _repair_ocr_dates(words, state.last_date)
         words = _dewarp(words)
     lines = group_lines(words)
