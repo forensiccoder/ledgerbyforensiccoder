@@ -12,7 +12,7 @@ import pandas as pd
 from .errors import StatementError
 from .extract import extract_statement
 from .models import Transaction
-from .narration import CASH_DEPOSIT, CASH_WITHDRAWAL, OTHER, TARGET_CATEGORIES, parse_narration
+from .narration import CASH_DEPOSIT, CASH_WITHDRAWAL, OTHER, TARGET_CATEGORIES, UPI, extract_phone, parse_narration
 from .normalize import build_transactions
 from .ocr_cleanup import clean_ocr_narrations
 from .reconcile import Reconciliation, reconcile, repair_from_balances
@@ -32,6 +32,7 @@ def apply_narration(t: Transaction) -> None:
     info = parse_narration(t.narration, t.direction)
     t.category, t.channel = info.category, info.channel
     t.vpa, t.ifsc, t.bank = info.vpa, info.ifsc, info.bank
+    t.phone = extract_phone(t.narration) if t.category == UPI else ""
     t.direction_hint = info.direction_hint
     t.confidence = info.confidence
     # A dedicated counterparty column in the statement beats anything inferred from narration.
@@ -58,7 +59,7 @@ def display_counterparty(t: Transaction) -> str:
 def to_dataframe(txns: list[Transaction]) -> pd.DataFrame:
     return pd.DataFrame([{
         "id": t.id, "date": t.date, "category": t.category, "channel": t.channel,
-        "direction": t.direction, "counterparty": display_counterparty(t), "vpa": t.vpa,
+        "direction": t.direction, "counterparty": display_counterparty(t), "vpa": t.vpa, "phone": t.phone,
         "ifsc": t.ifsc, "bank": t.bank, "reference": t.reference, "amount": t.amount,
         "balance": t.balance, "narration": t.narration, "page": t.page, "row": t.row,
         "confidence": t.confidence, "flags": ", ".join(t.flags),
@@ -97,6 +98,7 @@ def txn_to_api(t: Transaction) -> dict:
         "direction": t.direction,
         "beneficiary": display_counterparty(t),
         "vpa": t.vpa,
+        "phone": t.phone,
         "ifsc": t.ifsc,
         "bank": t.bank,
         "reference": t.reference,

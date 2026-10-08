@@ -429,6 +429,27 @@ def _other_details(narration: str) -> tuple[str, str]:
     return "", ""
 
 
+# A mobile number inside a UPI narration: ten digits starting 6-9, either as a field of its own
+# between slashes ("/BKID/9540062540/Paymen-") or as the user part of a handle
+# ("9718857841@KOTAK", "9462013057-2@AXL"). Never part of a longer digit run, so a 12-digit RRN or a
+# 16-digit reference cannot yield one by accident.
+_PHONE_FIELD = re.compile(r"(?:^|/)\s*([6-9](?:\s?\d){9})\s*(?=/|-|$)")
+_PHONE_HANDLE = re.compile(r"(?<!\d)([6-9]\d{9})(?!\d)(?=(?:-\d)?\s?@)")
+
+
+def extract_phone(narration: str) -> str:
+    """The 10-digit mobile number named in a UPI narration, or ""."""
+    text = narration or ""
+    for match in _PHONE_FIELD.finditer(text):
+        digits = re.sub(r"\s", "", match.group(1))
+        before = text[: match.start(1)]
+        after = text[match.end(1):]
+        if len(digits) == 10 and not before.rstrip().endswith(tuple("0123456789")) and not after.lstrip().startswith(tuple("0123456789")):
+            return digits
+    handle = _PHONE_HANDLE.search(text)
+    return handle.group(1) if handle else ""
+
+
 def parse_narration(narration: str, direction: str = "Unknown") -> NarrationInfo:
     """Classify a narration. ``direction`` is "Credit"/"Debit"/"Unknown" (from the amount columns)."""
     text = _norm_text(narration)

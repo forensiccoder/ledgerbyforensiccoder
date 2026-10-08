@@ -17,6 +17,7 @@ type Transaction = {
   amount: number;
   source: string;
   statementId?: string; // which uploaded statement the row came from
+  phone: string; // the 10-digit mobile number named in a UPI narration, or ""
   unnamed?: boolean; // no counterparty could be read; beneficiary holds the kind of row instead
 };
 
@@ -62,7 +63,7 @@ const API_BASE = (process.env.NEXT_PUBLIC_LEDGERLENS_API_URL ?? "http://localhos
 
 type ApiTransaction = {
   id: string; date: string; dateIso: string; category: Category; direction: Direction;
-  beneficiary: string; reference: string; narration: string; amount: number; source: string; channel?: string;
+  beneficiary: string; reference: string; narration: string; amount: number; source: string; channel?: string; phone?: string;
 };
 
 type ApiError = { code: string; message: string };
@@ -102,7 +103,7 @@ async function analyzeFile(file: File, password?: string): Promise<ParsedFile> {
       // An "Other" row has no counterparty the parser could name; show what kind of row it is instead.
       unnamed: t.category === "Other" && t.beneficiary === "Review narration",
       beneficiary: t.category === "Other" && t.beneficiary === "Review narration" ? (t.channel || "Unclassified") : t.beneficiary, narration: t.narration, reference: t.reference || "—",
-      amount: t.amount, source: t.source,
+      amount: t.amount, source: t.source, phone: t.phone ?? "",
     })),
     totalRows: data.totalRows,
     unclassified: data.summary.otherCount,
@@ -124,6 +125,7 @@ export default function Home() {
   const nextStatementId = useRef(1);
   const [activeCategory, setActiveCategory] = useState<Category | "All">("All");
   const [activeCounterparty, setActiveCounterparty] = useState("All");
+  const [activePhone, setActivePhone] = useState("All");
   const [search, setSearch] = useState("");
   // Materiality: keep only transactions at/above ("above") or at/below ("below") an amount.
   const [materialityMode, setMaterialityMode] = useState<"above" | "below">("above");
@@ -135,7 +137,7 @@ export default function Home() {
   // Switching category clears any counterparty drill-down from before - otherwise the two filters
   // combine (AND logic) and can silently show zero rows for a category that plainly has matches,
   // just because the previously selected counterparty doesn't happen to appear in it.
-  const selectCategory = (category: Category | "All") => { setActiveCategory(category); setActiveCounterparty("All"); };
+  const selectCategory = (category: Category | "All") => { setActiveCategory(category); setActiveCounterparty("All"); setActivePhone("All"); };
 
   // Statements that cover the same dates can repeat the same transactions; counting both copies
   // would double the totals. A repeat is the same date, direction and amount with the same
@@ -199,14 +201,28 @@ export default function Home() {
     return [...counts.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name));
   }, [targetTransactions]);
 
+  // Phone numbers found in the rows being looked at (the selected category / statement), most
+  // frequent first, so the dropdown only offers numbers that would actually match something.
+  const phoneOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const transaction of targetTransactions) {
+      if (!transaction.phone) continue;
+      if (activeCategory !== "All" && transaction.category !== activeCategory) continue;
+      if (activeStatement !== "All" && transaction.statementId !== activeStatement) continue;
+      counts.set(transaction.phone, (counts.get(transaction.phone) ?? 0) + 1);
+    }
+    return [...counts.entries()].map(([phone, count]) => ({ phone, count })).sort((a, b) => b.count - a.count || a.phone.localeCompare(b.phone));
+  }, [targetTransactions, activeCategory, activeStatement]);
+
   const filtered = useMemo(() => targetTransactions.filter((transaction) => {
     const categoryMatches = activeCategory === "All" || transaction.category === activeCategory;
     const counterpartyMatches = activeCounterparty === "All" || transaction.beneficiary === activeCounterparty;
+    const phoneMatches = activePhone === "All" || transaction.phone === activePhone;
     const statementMatches = activeStatement === "All" || transaction.statementId === activeStatement;
     const searchText = `${transaction.beneficiary} ${transaction.narration} ${transaction.reference}`.toLowerCase();
     const materialityMatches = materialityAmount === null || (materialityMode === "above" ? transaction.amount >= materialityAmount : transaction.amount <= materialityAmount);
-    return categoryMatches && counterpartyMatches && statementMatches && materialityMatches && searchText.includes(search.trim().toLowerCase());
-  }).sort((a, b) => a.dateIso.localeCompare(b.dateIso)), [targetTransactions, activeCategory, activeCounterparty, activeStatement, search, materialityMode, materialityAmount]);
+    return categoryMatches && counterpartyMatches && phoneMatches && statementMatches && materialityMatches && searchText.includes(search.trim().toLowerCase());
+  }).sort((a, b) => a.dateIso.localeCompare(b.dateIso)), [targetTransactions, activeCategory, activeCounterparty, activePhone, activeStatement, search, materialityMode, materialityAmount]);
 
   // Net, not gross: a category like NEFT or UPI can hold both incoming and outgoing transactions,
   // so summing every amount as positive would overstate what actually moved. Cash deposit/
@@ -248,16 +264,16 @@ export default function Home() {
     }));
     setStatements((current) => [...current, ...entries.map(({ entry }) => entry)]);
     // The counterparty list changes with the data; start it fresh so a stale pick cannot hide everything.
-    setActiveCounterparty("All"); setMaterialityOpen(false);
+    setActiveCounterparty("All"); setActivePhone("All"); setMaterialityOpen(false);
     for (const { entry, file } of entries) await readStatement(entry.id, file);
   };
 
   const removeStatement = (id: string) => {
     setStatements((current) => current.filter((statement) => statement.id !== id));
-    setActiveCounterparty("All");
+    setActiveCounterparty("All"); setActivePhone("All");
     if (activeStatement === id) setActiveStatement("All");
   };
-  const clearStatements = () => { setStatements([]); setDropDuplicates(false); setActiveStatement("All"); setActiveCategory("All"); setActiveCounterparty("All"); setSearch(""); setMaterialityInput(""); setMaterialityOpen(false); };
+  const clearStatements = () => { setStatements([]); setDropDuplicates(false); setActiveStatement("All"); setActiveCategory("All"); setActiveCounterparty("All"); setActivePhone("All"); setSearch(""); setMaterialityInput(""); setMaterialityOpen(false); };
 
   const onInput = (event: ChangeEvent<HTMLInputElement>) => { void handleFiles(event.target.files); event.target.value = ""; };
   const onDrop = (event: DragEvent<HTMLDivElement>) => { event.preventDefault(); setDragging(false); void handleFiles(event.dataTransfer.files); };
@@ -281,6 +297,7 @@ export default function Home() {
       "Category": transaction.category,
       "Direction": transaction.direction,
       "Beneficiary / payer": transaction.beneficiary,
+      "Phone number": transaction.phone,
       "Amount (INR)": transaction.amount,
       "Reference / UTR": transaction.reference === "—" ? "" : transaction.reference,
       "Statement narration": transaction.narration,
@@ -342,11 +359,11 @@ export default function Home() {
         <div className="table-card">
           <div className="table-toolbar">
             <div><span className="section-kicker">Categorised activity</span><h3>{fileName ? fileName : "Upload statements to begin"}</h3></div>
-            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label>{multiple && <select className="counterparty-filter" value={activeStatement} onChange={(event) => setActiveStatement(event.target.value)} aria-label="Filter by statement"><option value="All">All statements</option>{readyStatements.map((statement) => <option key={statement.id} value={statement.id}>{statement.name}</option>)}</select>}<select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><div className="materiality"><button className={`button materiality-toggle ${materialityAmount !== null ? "active" : ""}`} type="button" onClick={() => setMaterialityOpen((open) => !open)} aria-expanded={materialityOpen} aria-haspopup="dialog" disabled={!targetTransactions.length}>Materiality{materialityAmount !== null ? `: ${materialityMode === "above" ? "≥" : "≤"} ${formatAmount(materialityAmount)}` : ""}</button>{materialityOpen && <div className="materiality-panel" role="dialog" aria-label="Materiality filter"><label>Show transactions<select value={materialityMode} onChange={(event) => setMaterialityMode(event.target.value as "above" | "below")}><option value="above">at or above</option><option value="below">at or below</option></select></label><label>Amount (₹)<input inputMode="decimal" value={materialityInput} onChange={(event) => setMaterialityInput(event.target.value)} placeholder="e.g. 50000" autoFocus /></label><div className="materiality-actions"><button className="button" type="button" onClick={() => setMaterialityInput("")} disabled={!materialityInput}>Clear</button><button className="button button-dark" type="button" onClick={() => setMaterialityOpen(false)}>Done</button></div></div>}</div><button className="button export" type="button" onClick={() => void exportWorkbook()} title={activeCategory === "All" ? "Export every category" : `Export only ${activeCategory}`} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
+            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label>{multiple && <select className="counterparty-filter" value={activeStatement} onChange={(event) => setActiveStatement(event.target.value)} aria-label="Filter by statement"><option value="All">All statements</option>{readyStatements.map((statement) => <option key={statement.id} value={statement.id}>{statement.name}</option>)}</select>}<select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><div className="materiality"><button className={`button materiality-toggle ${materialityAmount !== null ? "active" : ""}`} type="button" onClick={() => setMaterialityOpen((open) => !open)} aria-expanded={materialityOpen} aria-haspopup="dialog" disabled={!targetTransactions.length}>Materiality{materialityAmount !== null ? `: ${materialityMode === "above" ? "≥" : "≤"} ${formatAmount(materialityAmount)}` : ""}</button>{materialityOpen && <div className="materiality-panel" role="dialog" aria-label="Materiality filter"><label>Show transactions<select value={materialityMode} onChange={(event) => setMaterialityMode(event.target.value as "above" | "below")}><option value="above">at or above</option><option value="below">at or below</option></select></label><label>Amount (₹)<input inputMode="decimal" value={materialityInput} onChange={(event) => setMaterialityInput(event.target.value)} placeholder="e.g. 50000" autoFocus /></label><div className="materiality-actions"><button className="button" type="button" onClick={() => setMaterialityInput("")} disabled={!materialityInput}>Clear</button><button className="button button-dark" type="button" onClick={() => setMaterialityOpen(false)}>Done</button></div></div>}</div><select className="counterparty-filter phone-filter" value={activePhone} onChange={(event) => setActivePhone(event.target.value)} disabled={!phoneOptions.length} aria-label="Filter by phone number"><option value="All">All phone numbers</option>{phoneOptions.map((option) => <option key={option.phone} value={option.phone}>{option.phone} ({option.count})</option>)}</select><button className="button export" type="button" onClick={() => void exportWorkbook()} title={activeCategory === "All" ? "Export every category" : `Export only ${activeCategory}`} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
           </div>
           <div className="filters" aria-label="Transaction category filters"><button className={activeCategory === "All" ? "selected" : ""} onClick={() => selectCategory("All")} type="button">All transactions <b>{targetTransactions.length}</b></button>{totals.map((total) => <button key={total.category} className={activeCategory === total.category ? "selected" : ""} onClick={() => selectCategory(total.category)} type="button">{total.category} <b>{total.count}</b></button>)}</div>
           <div className="table-wrap">
-            {filtered.length ? <table><thead><tr><th>Transaction date</th><th>Category</th><th>Beneficiary / payer</th><th>Reference</th><th>Narration</th>{multiple && <th>Statement</th>}<th className="amount">Amount</th></tr></thead><tbody>{filtered.map((transaction) => <tr key={transaction.id}><td className="date-cell">{transaction.date}<small className={directionClass(transaction.direction)}>{transaction.direction}</small></td><td><span className={`tag ${categoryClass[transaction.category]}`}>{transaction.category}</span></td><td className="beneficiary">{transaction.beneficiary}</td><td className="reference">{transaction.reference}</td><td className="narration">{transaction.narration}</td>{multiple && <td className="statement-cell">{statements.find((statement) => statement.id === transaction.statementId)?.name}</td>}<td className={`amount ${directionClass(transaction.direction)}`}>{signedAmount(transaction.direction, transaction.amount)}</td></tr>)}</tbody></table> : <div className="empty-state"><div>⌁</div><strong>{status === "ready" ? "No matching activity" : "Your forensic review starts here"}</strong><p>{status === "ready" ? "Try another category or search phrase." : "Upload statements to extract cash deposits, cash withdrawals, NEFT and UPI transactions."}</p></div>}
+            {filtered.length ? <table><thead><tr><th>Transaction date</th><th>Category</th><th>Beneficiary / payer</th><th>Phone number</th><th>Reference</th><th>Narration</th>{multiple && <th>Statement</th>}<th className="amount">Amount</th></tr></thead><tbody>{filtered.map((transaction) => <tr key={transaction.id}><td className="date-cell">{transaction.date}<small className={directionClass(transaction.direction)}>{transaction.direction}</small></td><td><span className={`tag ${categoryClass[transaction.category]}`}>{transaction.category}</span></td><td className="beneficiary">{transaction.beneficiary}</td><td className="phone-cell">{transaction.phone || "—"}</td><td className="reference">{transaction.reference}</td><td className="narration">{transaction.narration}</td>{multiple && <td className="statement-cell">{statements.find((statement) => statement.id === transaction.statementId)?.name}</td>}<td className={`amount ${directionClass(transaction.direction)}`}>{signedAmount(transaction.direction, transaction.amount)}</td></tr>)}</tbody></table> : <div className="empty-state"><div>⌁</div><strong>{status === "ready" ? "No matching activity" : "Your forensic review starts here"}</strong><p>{status === "ready" ? "Try another category or search phrase." : "Upload statements to extract cash deposits, cash withdrawals, NEFT and UPI transactions."}</p></div>}
           </div>
           <footer className="table-footer"><span>{targetTransactions.length ? `${filtered.length} of ${targetTransactions.length} detected transactions shown` : "No statement loaded"}</span><span>Review beneficiary inference against the original narration before relying on it.</span></footer>
         </div>

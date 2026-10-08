@@ -43,6 +43,7 @@ class Transaction:
     channel: str = ""
     counterparty: str = ""
     vpa: str = ""
+    phone: str = ""  # 10-digit mobile number named in a UPI narration
     ifsc: str = ""
     bank: str = ""
     reference: str = ""
