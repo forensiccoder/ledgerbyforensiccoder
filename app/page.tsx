@@ -109,6 +109,7 @@ async function analyzeFile(file: File, password?: string): Promise<ParsedFile> {
   };
 }
 
+function formatDay(iso: string) { return new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }); }
 function formatAmount(amount: number) { return numberFormatter.format(amount); }
 // Amounts are stored as absolute values (see backend Money model) with direction tracked
 // separately, so the sign shown here is derived, not part of the number itself.
@@ -136,9 +137,37 @@ export default function Home() {
   // just because the previously selected counterparty doesn't happen to appear in it.
   const selectCategory = (category: Category | "All") => { setActiveCategory(category); setActiveCounterparty("All"); };
 
+  // Statements that cover the same dates can repeat the same transactions; counting both copies
+  // would double the totals. A repeat is the same date, direction and amount with the same
+  // reference (or, with no reference, the same narration) in a *different* statement.
+  const overlap = useMemo(() => {
+    const ready = statements.filter((statement) => statement.status === "ready" && statement.transactions.length);
+    if (ready.length < 2) return null;
+    const keyOf = (t: Transaction) => `${t.dateIso}|${t.direction}|${t.amount.toFixed(2)}|${t.reference !== "—" ? t.reference : t.narration.slice(0, 40)}`;
+    const firstSeen = new Map<string, string>();
+    const duplicates = new Set<string>(); // "statementId:rowId" of the later copy
+    for (const statement of ready) for (const t of statement.transactions) {
+      const key = keyOf(t);
+      const owner = firstSeen.get(key);
+      if (owner === undefined) firstSeen.set(key, statement.id);
+      else if (owner !== statement.id) duplicates.add(`${statement.id}:${t.id}`);
+    }
+    const spans = ready.map((statement) => { const dates = statement.transactions.map((t) => t.dateIso).sort(); return { name: statement.name, from: dates[0], to: dates[dates.length - 1] }; });
+    const periods: { a: string; b: string; from: string; to: string }[] = [];
+    for (let i = 0; i < spans.length; i++) for (let j = i + 1; j < spans.length; j++) {
+      const from = spans[i].from > spans[j].from ? spans[i].from : spans[j].from;
+      const to = spans[i].to < spans[j].to ? spans[i].to : spans[j].to;
+      if (from <= to) periods.push({ a: spans[i].name, b: spans[j].name, from, to });
+    }
+    return periods.length || duplicates.size ? { periods, duplicates } : null;
+  }, [statements]);
+  const [dropDuplicates, setDropDuplicates] = useState(false);
+
   // Every statement that has been read, merged into one list. Row ids are only unique within a
   // statement, so they are prefixed with the statement's own id here.
-  const transactions = useMemo(() => statements.flatMap((statement) => statement.transactions.map((transaction) => ({ ...transaction, id: `${statement.id}:${transaction.id}`, statementId: statement.id }))), [statements]);
+  const transactions = useMemo(() => statements.flatMap((statement) => statement.transactions
+    .filter((transaction) => !(dropDuplicates && overlap?.duplicates.has(`${statement.id}:${transaction.id}`)))
+    .map((transaction) => ({ ...transaction, id: `${statement.id}:${transaction.id}`, statementId: statement.id }))), [statements, dropDuplicates, overlap]);
   const status: "idle" | "processing" | "ready" | "error" = !statements.length ? "idle" : statements.some((statement) => statement.status === "processing") ? "processing" : statements.some((statement) => statement.status === "ready") ? "ready" : "error";
   const multiple = statements.length > 1;
   const readyStatements = statements.filter((statement) => statement.status === "ready");
@@ -228,7 +257,7 @@ export default function Home() {
     setActiveCounterparty("All");
     if (activeStatement === id) setActiveStatement("All");
   };
-  const clearStatements = () => { setStatements([]); setActiveStatement("All"); setActiveCategory("All"); setActiveCounterparty("All"); setSearch(""); setMaterialityInput(""); setMaterialityOpen(false); };
+  const clearStatements = () => { setStatements([]); setDropDuplicates(false); setActiveStatement("All"); setActiveCategory("All"); setActiveCounterparty("All"); setSearch(""); setMaterialityInput(""); setMaterialityOpen(false); };
 
   const onInput = (event: ChangeEvent<HTMLInputElement>) => { void handleFiles(event.target.files); event.target.value = ""; };
   const onDrop = (event: DragEvent<HTMLDivElement>) => { event.preventDefault(); setDragging(false); void handleFiles(event.dataTransfer.files); };
@@ -303,6 +332,7 @@ export default function Home() {
           <input ref={fileInput} type="file" multiple accept=".pdf,.csv,.xlsx,.xls,application/pdf,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={onInput} />
         </div>
         {statements.length > 0 && <div className="statement-list" aria-label="Uploaded statements">{statements.map((statement) => <span key={statement.id} className={`statement-chip ${statement.status}`} title={statement.message || statement.name}><b>{statement.status === "processing" ? "…" : statement.status === "error" ? "!" : "✓"}</b><span className="statement-name">{statement.name}</span>{statement.status === "ready" && <small>{statement.transactions.length.toLocaleString("en-IN")}</small>}<button type="button" onClick={() => removeStatement(statement.id)} aria-label={`Remove ${statement.name}`}>×</button></span>)}{statements.length > 1 && <button className="statement-clear" type="button" onClick={clearStatements}>Clear all</button>}</div>}
+        {overlap && <div className="overlap-note" role="status"><strong>Overlapping statements.</strong> {overlap.periods.length ? overlap.periods.map((period, index) => <span key={index}>{period.a} and {period.b} both cover {formatDay(period.from)}{period.from !== period.to ? ` – ${formatDay(period.to)}` : ""}. </span>) : null}{overlap.duplicates.size ? <>{overlap.duplicates.size.toLocaleString("en-IN")} transaction{overlap.duplicates.size === 1 ? " appears" : "s appear"} in more than one statement and {dropDuplicates ? "the repeats are hidden" : "are counted twice"}. <button type="button" onClick={() => setDropDuplicates((on) => !on)}>{dropDuplicates ? "Show repeats" : `Remove ${overlap.duplicates.size.toLocaleString("en-IN")} repeat${overlap.duplicates.size === 1 ? "" : "s"}`}</button></> : "No repeated transactions were found."}</div>}
         <div className={`privacy-line ${status === "error" ? "error" : ""}`}><span>{status === "error" ? "!" : "✓"}</span>{message || "Statements are sent to the LedgerLens analysis service for extraction. Scanned PDFs are OCR'd automatically."}</div>
 
         <div className="summary-grid">

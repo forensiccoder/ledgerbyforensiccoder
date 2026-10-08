@@ -63,3 +63,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .statement-chip button:hover, .statement-clear:hover { color: var(--ink); }
 .statement-clear { padding: 6px 8px; font-size: 12px; text-decoration: underline; }
 .statement-cell { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #666; font-size: 11px; }
+.overlap-note { max-width: 1280px; margin: 10px auto 0; padding: 9px 12px; border: 1px solid #e0c35a; background: #fff8d6; font-size: 12px; line-height: 1.5; }
+.overlap-note button { margin-left: 4px; padding: 3px 9px; border: 1px solid var(--ink); background: var(--paper); font-size: 12px; cursor: pointer; }
+.overlap-note button:hover { background: var(--amber); }

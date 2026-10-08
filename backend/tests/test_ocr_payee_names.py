@@ -19,7 +19,7 @@ from app.ocr_cleanup import clean_ocr_narrations
 
 
 def _txn(i: int, narration: str) -> Transaction:
-    return Transaction(id=f"t{i}", date=date(2026, 5, i + 1), amount=Decimal("10.00"), narration=narration,
+    return Transaction(id=f"t{i}", date=date(2026, 5, 1 + i % 28), amount=Decimal("10.00"), narration=narration,
                        source="s.pdf", direction="Debit", direction_source="column", page=1, row=i)
 
 
@@ -67,3 +67,29 @@ def test_amount_with_a_symbol_for_its_leading_five_is_restored():
 
 def test_gap_inside_a_handle_number_is_closed():
     assert _repair_vpa("UPI-MUMTAZ ANSARI-971885784 1@KOTAK-KKBK") == "UPI-MUMTAZ ANSARI-9718857841@KOTAK-KKBK"
+
+
+def _sbi(i: int, name: str, kind: str = "DR") -> Transaction:
+    return _txn(i, f"TO TRANSFER- UPI/{kind}/{400000000000 + i}/{name}/YESB/paytmqr281/Payme-")
+
+
+def test_names_cut_by_the_25_column_wrap_are_rejoined_only_when_the_pieces_say_so():
+    rows = [_sbi(i, "SHAKE EL") for i in range(4)] + [_sbi(10 + i, "HIMAC HAL") for i in range(3)]
+    rows += [_sbi(20 + i, "MUNNI DEVI") for i in range(3)] + [_sbi(30 + i, "ZAFAR HA") for i in range(3)]
+    rows += [_sbi(40, "ASHIS HK"), _sbi(41, "KASHM 5, IR"), _sbi(42, 'PRASH “ANT')]
+    clean_ocr_narrations(rows)
+    names = [t.narration.split("/")[3] for t in rows]
+    assert names[:4] == ["SHAKEEL"] * 4 and names[4:7] == ["HIMACHAL"] * 3
+    assert names[7:10] == ["MUNNI DEVI"] * 3          # a real two-word name stays two words
+    assert names[10:13] == ["ZAFAR HA"] * 3           # nothing proves ZAFAR HA is one word
+    assert names[13] == "ASHISH K"                    # a name and the initial that ran into it
+    assert names[14] == "KASHMIR" and names[15] == "PRASHANT"  # junk marks inside a name are dropped first
+
+
+def test_bank_code_glued_onto_a_name_and_a_misread_upi_tag_are_repaired():
+    rows = [_sbi(i, "SHAKE EL") for i in range(12)]
+    rows.append(_txn(50, "TO TRANSFER- UPI/DR/412345678901/IRFAN ALIYESB/paytm/Pay-"))
+    rows.append(_txn(51, "BY TRANSFER- UPUCR/4307 54565232/AAKASH C/PUNB/931/NA-"))
+    clean_ocr_narrations(rows)
+    assert rows[12].narration.startswith("TO TRANSFER- UPI/DR/412345678901/IRFAN ALI/YESB")
+    assert rows[13].narration.startswith("BY TRANSFER- UPI/CR/430754565232/AAKASH C/PUNB")

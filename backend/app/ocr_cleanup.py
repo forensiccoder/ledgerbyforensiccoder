@@ -40,7 +40,7 @@ def _name_field(narration: str) -> re.Match[str] | None:
 
 
 _TRANSFER_LEAD = re.compile(r"^[\W\d]{0,20}?\s*((?:TO|BY)\s*TRANSFER)\s*[-:.]*\s*(.*)$", re.I | re.S)
-_UPI_BODY = re.compile(r"[^\w/]*\bUPI/(?P<kind>[A-Za-z0-9]{1,3})/?\s*(?P<rrn>[0-9A-Za-z][0-9A-Za-z ]{9,15}?)(?=/|[A-Za-z]{3,}|-|$)")
+_UPI_BODY = re.compile(r"[^\w/]*\bUP[IUl1|!][/\s]?(?P<kind>[A-Za-z0-9]{1,3})/?\s*(?P<rrn>[0-9A-Za-z][0-9A-Za-z ]{9,15}?)(?=/|[A-Za-z]{3,}|-|$)")
 _RRN_LOOKALIKES = str.maketrans({"S": "5", "s": "5", "O": "0", "o": "0", "I": "1", "l": "1", "B": "8", "Z": "2"})
 
 
@@ -95,6 +95,8 @@ def clean_ocr_narrations(txns: list[Transaction]) -> None:
         if m and not _TRAILING_SYMBOL.match(m.group(2)):
             clean_names.add(m.group(2).strip().upper())
 
+    _resolve_wrapped_names(txns)
+
     for t in txns:
         m = _name_field(t.narration)
         if not m:
@@ -134,3 +136,94 @@ def _fix_lookalike_words(name: str, vocabulary: Counter[str]) -> str:
                 continue
             break
     return " ".join(words)
+
+
+# ----------------------------------------------------------------------------------------------
+# "TO TRANSFER- UPI/DR/<rrn>/<NAME>/<bank>/<handle>/..." (SBI): names the hard wrap cut in two
+# ----------------------------------------------------------------------------------------------
+_SBI_NAME_FIELD = re.compile(r"^((?:TO|BY) TRANSFER- UPI/(?:DR|CR)/\d{12}/)([^/]*)(/.*)?$", re.S)
+_NAME_JUNK = re.compile(r"[\u201c\u201d\u2018\u2019\"'`\[\]\(\)\\|_{}~*^<>,;:!?]+")
+_BANK_CODES = ("YESB", "UTIB", "SBIN", "KKBK", "PUNB", "HDFC", "ICIC", "IDIB", "BARB", "CNRB", "UBIN", "BKID", "UCBA",
+               "INDB", "IOBA", "FDRL", "CBIN", "PPIW", "AIRP", "IBKL", "MAHB", "ORBC", "PSIB", "SCBL", "CITI")
+
+# Given names and words a name field may legitimately hold *whole* (so a space after them is a
+# real space), and words that follow a first name as a second word. Used only to decide whether a
+# break at the wrap column fell between two words or inside one; not a name database.
+_WHOLE_FIRST_WORDS = frozenset("""
+AMRIT ANGAD ARJUN ASHOK BABLU BHOLA DEEPA DEEPU DILIP GOPAL HARSH ISHAN KAPIL KAMAL KARAN KIRAN MOHAN MOHIT MUNNI
+NASIM NAVIN NITIN PAPPU PRIYA RAHUL RAJAN RAJIV RAMAN ROHAN ROHIT SAHIL SALIM SAMIR SANJU SATYA SHAAN SHIVA SONAL
+SUMIT SUNIL SURAJ TARUN UMESH VIJAY VIKAS VINAY VIPIN ANITA ASHIF AFZAL AKASH AMEER ANVAR ARIF ASLAM AYUSH BABUL
+BILAL DANISH FAIZ FIROZ GAURV GULAB HAMID IMRAN JAVED KALEEM KAMIL LATIF MAHIR MAJID MOHSIN NADIM NAEEM NASIR NAZIM
+RAIS RAJU RAFIQ RASHID RIZWAN SABIR SAEED SAJID SALMAN SHAHID SHAKIL SHOAIB SOHAIL TAHIR WASIM YUSUF ZAHID ZUBAIR
+MUKESH LALIT KUNAL LOKESH MANOJ NEERAJ PAWAN PRAMOD PREM RAJESH RAKESH RAMESH SANJAY SUBHASH SURESH VIKRAM VINOD
+""".split())
+_SECOND_WORDS = frozenset("""
+DEVI KHAN ALI KUMAR KUM SINGH SAHU RAM LAL PAL SHAH SHAIKH ANSARI QURESHI BEGUM AHMAD AHMED HASAN HUSSAIN MALIK
+SHARMA VERMA GUPTA YADAV MISHRA TIWARI PANDEY JAIN AGARWAL CHAND PRASAD DAS NATH RAJ MOHD MD MR MRS MS
+""".split())
+_GLUE_TARGETS = frozenset("""
+KRISHNA PRASHANT SHAKEEL HIMACHAL MOHAMMAD MOHAMMED MOHAMAD SHAMSHAD FARZANA DEVENDER DEVENDRA RAJENDRA RAJENDER
+MAHENDRA MAHENDER KASHMIR VAISHNAV CHANDESH EHTESHAM YAKUB ZAFAR MAUMEEN MOHSEEN NASIMA SHAHZAD KISHWAR SHEHRAJ
+SHABNAM MANISHA MANJARA SATLAKSH SHIVENDRA PRADEEP RAJDEEP HEALTHSA EXPRESS FRIENDS ASHISH GAURAV AAKASH AAKAS
+SAJAKAT RIYASAT HARIRAM TABREZ SHASHDIP IKARAM
+""".split())
+
+
+def _clean_name_field(name: str) -> str:
+    name = _NAME_JUNK.sub(" ", name)
+    tokens = [t for t in name.split() if re.search(r"[A-Za-z]", t)]  # a bare digit or dash is not a name part
+    return " ".join(tokens)
+
+
+def _split_bank_code(name: str) -> tuple[str, str]:
+    """"IRFAN ALIYESB": the bank code the next field starts with, glued onto the name."""
+    last = name.split(" ")[-1] if name else ""
+    for code in _BANK_CODES:
+        if last.upper().endswith(code) and len(last) > len(code) + 1:
+            head = name[: len(name) - len(code)].rstrip()
+            return head, code
+    return name, ""
+
+
+def _glue_at_wrap(tokens: list[str]) -> list[str]:
+    """Decide whether the first two tokens are one word the wrap cut apart."""
+    t1, t2, rest = tokens[0], tokens[1], tokens[2:]
+    glued = (t1 + t2).upper()
+    if glued in _GLUE_TARGETS or glued in _COMMON_NAMES:
+        return [t1 + t2, *rest]
+    if t1.upper() in _WHOLE_FIRST_WORDS or t1.upper() in _COMMON_NAMES or t2.upper() in _SECOND_WORDS:
+        return tokens
+    # A known name followed by an initial that ran into it ("ASHIS" + "HK" -> "ASHISH" "K").
+    for known in sorted(_WHOLE_FIRST_WORDS | _COMMON_NAMES, key=len, reverse=True):
+        if len(known) >= 4 and glued.startswith(known) and 1 <= len(glued) - len(known) <= 2:
+            return [t1 + t2[: len(known) - len(t1)], t2[len(known) - len(t1):], *rest]
+    return tokens  # no evidence either way: two words is the safer reading than a spelling nobody wrote
+
+
+def _resolve_wrapped_names(txns: list[Transaction]) -> None:
+    """Clean the name field of "UPI/DR/<rrn>/<NAME>/..." narrations and rejoin names the hard wrap cut.
+
+    The wrap falls after a fixed number of characters, so a name cut by it always has the same first
+    -token length (5 characters in the statements seen). Only a name whose first token has that
+    length is a candidate; everything else keeps its spacing."""
+    parsed: list[tuple[Transaction, re.Match[str], list[str], str]] = []
+    for t in txns:
+        m = _SBI_NAME_FIELD.match(t.narration.strip())
+        if not m:
+            continue
+        name, code = _split_bank_code(_clean_name_field(m.group(2)))
+        parsed.append((t, m, name.split(), code))
+    lengths = Counter(len(tokens[0]) for _, _, tokens, _ in parsed if len(tokens) >= 2)
+    boundary = 0
+    if lengths and sum(lengths.values()) >= 12:
+        length, count = lengths.most_common(1)[0]
+        if count >= 0.25 * sum(lengths.values()):
+            boundary = length
+    for t, m, tokens, code in parsed:
+        if boundary and len(tokens) >= 2 and len(tokens[0]) == boundary:
+            tokens = _glue_at_wrap(tokens)
+        name = " ".join(tokens)
+        tail = m.group(3) or ""
+        if code:
+            tail = f"/{code}{tail}" if not tail.startswith("/" + code) else tail
+        t.narration = f"{m.group(1)}{name}{tail}"
