@@ -279,7 +279,7 @@ export default function Home() {
   const onDrop = (event: DragEvent<HTMLDivElement>) => { event.preventDefault(); setDragging(false); void handleFiles(event.dataTransfer.files); };
 
   const exportWorkbook = async () => {
-    if (!targetTransactions.length) return;
+    if (!filtered.length) return;
     const XLSX = await import("xlsx-js-style");
     const workbook = XLSX.utils.book_new();
     // json_to_sheet + a bold header row (the first row of every sheet holds the column headers).
@@ -304,19 +304,40 @@ export default function Home() {
       "Source file": transaction.source,
     }));
     const stamp = new Date().toISOString().slice(0, 10);
+    // The export is what the table shows: every selection made on the dashboard (category,
+    // counterparty, phone number, statement, materiality, search, hidden repeats) narrows the rows.
+    const applied: { Filter: string; Value: string }[] = [];
+    if (activeCategory !== "All") applied.push({ Filter: "Category", Value: activeCategory });
+    if (activeCounterparty !== "All") applied.push({ Filter: "Counterparty", Value: activeCounterparty });
+    if (activePhone !== "All") applied.push({ Filter: "Phone number", Value: activePhone });
+    if (activeStatement !== "All") applied.push({ Filter: "Statement", Value: statements.find((statement) => statement.id === activeStatement)?.name ?? activeStatement });
+    if (materialityAmount !== null) applied.push({ Filter: "Materiality", Value: `${materialityMode === "above" ? "at or above" : "at or below"} ${formatAmount(materialityAmount)}` });
+    if (search.trim()) applied.push({ Filter: "Search", Value: search.trim() });
+    if (dropDuplicates && overlap?.duplicates.size) applied.push({ Filter: "Repeated transactions", Value: `${overlap.duplicates.size} hidden (appear in more than one statement)` });
+    const filtersSheet = () => toSheet([...applied, { Filter: "Rows exported", Value: String(filtered.length) }, { Filter: "Exported on", Value: new Date().toLocaleString("en-IN") }]);
+
     if (activeCategory !== "All") {
-      // A category is selected: export just that category - exactly the rows on screen, so the
-      // counterparty / materiality / search filters applied to it carry into the file.
       XLSX.utils.book_append_sheet(workbook, toSheet(rowsFor(filtered)), activeCategory.slice(0, 31));
-      XLSX.writeFile(workbook, `ledgerlens-${activeCategory.toLowerCase().replace(/\s+/g, "-")}-${stamp}.xlsx`, { compression: true });
+      XLSX.utils.book_append_sheet(workbook, filtersSheet(), "Filters applied");
+      XLSX.writeFile(workbook, `ledgerlens-${activeCategory.toLowerCase().replace(/\s+/g, "-")}${applied.length > 1 ? "-filtered" : ""}-${stamp}.xlsx`, { compression: true });
       return;
     }
-    XLSX.utils.book_append_sheet(workbook, toSheet(totals.map((total) => ({ Category: total.category, Transactions: total.count, "Net amount (INR)": total.amount }))), "Summary");
-    TARGET_CATEGORIES.forEach((category) => {
-      const sheet = toSheet(rowsFor(targetTransactions.filter((transaction) => transaction.category === category)));
-      XLSX.utils.book_append_sheet(workbook, sheet, category.slice(0, 31));
+    // "All" categories: with nothing else selected this is the full review (every category sheet);
+    // with other selections it is the same layout built from just the rows that match them.
+    const narrowed = applied.length > 0;
+    const summaryRows = TARGET_CATEGORIES.map((category) => {
+      const matches = filtered.filter((transaction) => transaction.category === category);
+      const net = matches.reduce((sum, transaction) => sum + (transaction.direction === "Debit" ? -transaction.amount : transaction.amount), 0);
+      return { Category: category, Transactions: matches.length, "Net amount (INR)": net };
     });
-    XLSX.writeFile(workbook, `ledgerlens-category-review-${stamp}.xlsx`, { compression: true });
+    XLSX.utils.book_append_sheet(workbook, toSheet(summaryRows), "Summary");
+    TARGET_CATEGORIES.forEach((category) => {
+      const matches = filtered.filter((transaction) => transaction.category === category);
+      if (narrowed && !matches.length) return;
+      XLSX.utils.book_append_sheet(workbook, toSheet(rowsFor(matches)), category.slice(0, 31));
+    });
+    if (narrowed) XLSX.utils.book_append_sheet(workbook, filtersSheet(), "Filters applied");
+    XLSX.writeFile(workbook, `ledgerlens-${narrowed ? "filtered-review" : "category-review"}-${stamp}.xlsx`, { compression: true });
   };
 
   return (
@@ -359,7 +380,7 @@ export default function Home() {
         <div className="table-card">
           <div className="table-toolbar">
             <div><span className="section-kicker">Categorised activity</span><h3>{fileName ? fileName : "Upload statements to begin"}</h3></div>
-            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label>{multiple && <select className="counterparty-filter" value={activeStatement} onChange={(event) => setActiveStatement(event.target.value)} aria-label="Filter by statement"><option value="All">All statements</option>{readyStatements.map((statement) => <option key={statement.id} value={statement.id}>{statement.name}</option>)}</select>}<select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><div className="materiality"><button className={`button materiality-toggle ${materialityAmount !== null ? "active" : ""}`} type="button" onClick={() => setMaterialityOpen((open) => !open)} aria-expanded={materialityOpen} aria-haspopup="dialog" disabled={!targetTransactions.length}>Materiality{materialityAmount !== null ? `: ${materialityMode === "above" ? "≥" : "≤"} ${formatAmount(materialityAmount)}` : ""}</button>{materialityOpen && <div className="materiality-panel" role="dialog" aria-label="Materiality filter"><label>Show transactions<select value={materialityMode} onChange={(event) => setMaterialityMode(event.target.value as "above" | "below")}><option value="above">at or above</option><option value="below">at or below</option></select></label><label>Amount (₹)<input inputMode="decimal" value={materialityInput} onChange={(event) => setMaterialityInput(event.target.value)} placeholder="e.g. 50000" autoFocus /></label><div className="materiality-actions"><button className="button" type="button" onClick={() => setMaterialityInput("")} disabled={!materialityInput}>Clear</button><button className="button button-dark" type="button" onClick={() => setMaterialityOpen(false)}>Done</button></div></div>}</div><select className="counterparty-filter phone-filter" value={activePhone} onChange={(event) => setActivePhone(event.target.value)} disabled={!phoneOptions.length} aria-label="Filter by phone number"><option value="All">All phone numbers</option>{phoneOptions.map((option) => <option key={option.phone} value={option.phone}>{option.phone} ({option.count})</option>)}</select><button className="button export" type="button" onClick={() => void exportWorkbook()} title={activeCategory === "All" ? "Export every category" : `Export only ${activeCategory}`} disabled={!targetTransactions.length}><span>↓</span> Export Excel</button></div>
+            <div className="toolbar-actions"><label className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or reference" aria-label="Search transactions" /></label>{multiple && <select className="counterparty-filter" value={activeStatement} onChange={(event) => setActiveStatement(event.target.value)} aria-label="Filter by statement"><option value="All">All statements</option>{readyStatements.map((statement) => <option key={statement.id} value={statement.id}>{statement.name}</option>)}</select>}<select className="counterparty-filter" value={activeCounterparty} onChange={(event) => setActiveCounterparty(event.target.value)} disabled={!counterpartyOptions.length} aria-label="Filter by counterparty"><option value="All">All counterparties</option>{counterpartyOptions.map((option) => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select><div className="materiality"><button className={`button materiality-toggle ${materialityAmount !== null ? "active" : ""}`} type="button" onClick={() => setMaterialityOpen((open) => !open)} aria-expanded={materialityOpen} aria-haspopup="dialog" disabled={!targetTransactions.length}>Materiality{materialityAmount !== null ? `: ${materialityMode === "above" ? "≥" : "≤"} ${formatAmount(materialityAmount)}` : ""}</button>{materialityOpen && <div className="materiality-panel" role="dialog" aria-label="Materiality filter"><label>Show transactions<select value={materialityMode} onChange={(event) => setMaterialityMode(event.target.value as "above" | "below")}><option value="above">at or above</option><option value="below">at or below</option></select></label><label>Amount (₹)<input inputMode="decimal" value={materialityInput} onChange={(event) => setMaterialityInput(event.target.value)} placeholder="e.g. 50000" autoFocus /></label><div className="materiality-actions"><button className="button" type="button" onClick={() => setMaterialityInput("")} disabled={!materialityInput}>Clear</button><button className="button button-dark" type="button" onClick={() => setMaterialityOpen(false)}>Done</button></div></div>}</div><select className="counterparty-filter phone-filter" value={activePhone} onChange={(event) => setActivePhone(event.target.value)} disabled={!phoneOptions.length} aria-label="Filter by phone number"><option value="All">All phone numbers</option>{phoneOptions.map((option) => <option key={option.phone} value={option.phone}>{option.phone} ({option.count})</option>)}</select><button className="button export" type="button" onClick={() => void exportWorkbook()} title={filtered.length ? `Export the ${filtered.length.toLocaleString("en-IN")} transaction${filtered.length === 1 ? "" : "s"} currently shown` : "Nothing to export with the current selection"} disabled={!filtered.length}><span>↓</span> Export Excel</button></div>
           </div>
           <div className="filters" aria-label="Transaction category filters"><button className={activeCategory === "All" ? "selected" : ""} onClick={() => selectCategory("All")} type="button">All transactions <b>{targetTransactions.length}</b></button>{totals.map((total) => <button key={total.category} className={activeCategory === total.category ? "selected" : ""} onClick={() => selectCategory(total.category)} type="button">{total.category} <b>{total.count}</b></button>)}</div>
           <div className="table-wrap">
