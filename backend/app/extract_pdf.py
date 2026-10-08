@@ -197,8 +197,17 @@ def extract_pdf(data: bytes, password: str | None = None, ocr_mode: str = "auto"
     if deferred:
         plans = plan_ocr_columns([words for _, _, words in deferred])
         results: list[list[RawRow]] = []
-        for (position, page_no, words), columns in zip(deferred, plans):
+        laid_out_before_wrap_known: list[int] = []
+        for n, ((position, page_no, words), columns) in enumerate(zip(deferred, plans)):
+            if not state.wrap_width:
+                laid_out_before_wrap_known.append(n)
             results.append(layout_page(words, page_no, state, ocr=True, columns_override=columns))
+        if state.wrap_width:
+            # The column's hard-wrap width only showed up once enough pages had been seen; pages
+            # read before that were joined without it, so read them again now that it is known.
+            for n in laid_out_before_wrap_known:
+                (_, page_no, words), columns = deferred[n], plans[n]
+                results[n] = layout_page(words, page_no, state, ocr=True, columns_override=columns)
         # Spliced back-to-front so earlier insert positions stay valid.
         for (position, _, _), page_rows in reversed(list(zip(deferred, results))):
             rows[position:position] = page_rows

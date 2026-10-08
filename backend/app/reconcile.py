@@ -46,11 +46,11 @@ def detect_order(txns: list[Transaction]) -> str:
     return "descending" if _pairs_matching(txns[::-1]) > _pairs_matching(txns) else "ascending"
 
 
-_CONFUSABLE = {"0": "986", "1": "47", "2": "7", "3": "8", "4": "1", "5": "6", "6": "50", "7": "12", "8": "03", "9": "0"}
+_CONFUSABLE = {"0": "986", "1": "47", "2": "7", "3": "8", "4": "1", "5": "69", "6": "50", "7": "12", "8": "03", "9": "05"}
 
 
 def _is_ocr_near_miss(read: Decimal, true: Decimal) -> bool:
-    """Could ``read`` be ``true`` with one digit swapped for a look-alike (1/4, 0/8/9, 5/6, 3/8...)?
+    """Could ``read`` be ``true`` with one digit swapped for a look-alike (1/4, 0/8/9, 5/6/9, 3/8...)?
     Anything else - a different amount altogether - is more likely a missing row than a misread."""
     a, b = f"{read:.2f}", f"{true:.2f}"
     if len(a) != len(b):

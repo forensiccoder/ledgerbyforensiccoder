@@ -114,13 +114,22 @@ def ocr_words(page, dpi: int = OCR_DPI) -> tuple[list[Word], float]:
     scale = 72.0 / dpi
     words, confs = _read_words(pytesseract, gray, 6, scale)
     mean = sum(confs) / len(confs) if confs else 0.0
-    if mean < SPARSE_PASS_BELOW:
+    shaky = sum(1 for c in confs if c < 30) / len(confs) if confs else 0.0
+    if mean < SPARSE_PASS_BELOW or shaky >= 0.03:
         # Whole-page "assume one block of text" (psm 6) silently skips cells it takes for
-        # background on a photographed page - whole amounts vanish. Sparse-text mode (psm 11) finds
-        # scattered words and misses different ones, so add whatever it found that psm 6 did not.
+        # background on a photographed page - whole amounts vanish - and turns an occasional line
+        # into garbage ("naif pian alata"). Sparse-text mode (psm 11) finds scattered words and gets
+        # different ones wrong, so add what it found that psm 6 did not, and let it overrule a word
+        # psm 6 was clearly unsure of.
         extra, extra_confs = _read_words(pytesseract, gray, 11, scale)
         for word, conf in zip(extra, extra_confs):
-            if not any(_overlaps(word, seen) for seen in words):
+            clashes = [k for k, seen in enumerate(words) if _overlaps(word, seen)]
+            if not clashes:
+                words.append(word)
+                confs.append(conf)
+            elif conf >= 70 and all(confs[k] < 40 for k in clashes):
+                for k in sorted(clashes, reverse=True):
+                    del words[k], confs[k]
                 words.append(word)
                 confs.append(conf)
         mean = sum(confs) / len(confs) if confs else 0.0

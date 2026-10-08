@@ -24,6 +24,7 @@ from datetime import date
 from .headers import LABELS, NUMERIC_ROLES, classify_header, header_ok
 from .models import RawRow
 from .money import is_money_like, parse_date, parse_money
+from .ocr_cleanup import _COMMON_NAMES
 
 
 @dataclass
@@ -79,6 +80,7 @@ class LayoutState:
     # the printed cell wrap on top of that, so a printed line break is sometimes *inside* a word
     # ("PAYMEN" / "T FROM PHONE") and sometimes at a space. 0 = not detected; else the chunk width.
     hard_wrap: int = 0
+    wrap_width: int = 0  # narration hard-wrapped at this many characters (set from the text itself)
     last_date: date | None = None  # last valid row date seen (OCR date repair)
     chunk_len: dict = field(default_factory=dict)  # (id(row cells), column) -> length of open chunk
     warnings: list[str] = field(default_factory=list)
@@ -102,7 +104,7 @@ _FOOTER = re.compile(
     # words of "office" rather than requiring them adjacent.
     r"(?:registered|regd\.?|corporate)\s*(?:[&,]|and)?\s*(?:regd\.?|corporate\s+)?\s*office|"
     r"statement (?:summary|of account)|generated (?:on|by)|legends?\b|"
-    r"closing\s*balance\s*includes\s*funds|contents\s*of\s*this\s*statement|^hdfc\s*bank\s*limited\s*$|"
+    r"count\s+of\s+transactions\s+for\s+the\s+selected|please\s+do\s+not\s+share\s+your|closing\s*balance\s*includes\s*funds|contents\s*of\s*this\s*statement|^hdfc\s*bank\s*limited\s*$|"
     r"abbreviations|customer care|toll[\s-]?free|nomination|this is a system|\bgstin\b|"
     r"important (?:notice|information)|unless the constituent|contents of this statement",
     re.I,
@@ -208,6 +210,25 @@ def _segment_header(block: list[Line], fuzzy: bool) -> list[Column]:
     return merged
 
 
+_HEADER_WORDS = {"date", "no", "details", "ref", "reference", "cheque", "chq", "number", "amount", "amt", "type", "dt"}
+
+
+def _is_header_continuation(line: Line, fuzzy: bool) -> bool:
+    """A line made only of header words ("Date", "No.", "Details"): the second row of a header whose
+    labels wrap ("Value / Date", "Ref No./Cheque / No."). Short OCR scraps among them are tolerated,
+    but at least one real header word is needed and nothing may carry a digit."""
+    real = 0
+    for w in line.words:
+        token = re.sub(r"[^a-z]", "", w.text.lower())
+        if re.search(r"\d", w.text):
+            return False
+        if token in _HEADER_WORDS or (token and classify_header(token, fuzzy)):
+            real += 1
+        elif len(token) > 4:
+            return False
+    return real > 0
+
+
 def find_header(lines: list[Line], fuzzy: bool = False) -> tuple[int, int, list[Column]] | None:
     for i in range(len(lines)):
         for span in (1, 2, 3):
@@ -216,6 +237,16 @@ def find_header(lines: list[Line], fuzzy: bool = False) -> tuple[int, int, list[
                 break
             columns = _segment_header(block, fuzzy)
             if header_ok({c.role for c in columns}):
+                # A header that wraps onto a further line of header words ("Value" over "Date")
+                # must be read as a whole - the first line alone misnames its columns ("Value" is
+                # an amount column, "Value Date" is not).
+                end = i + span
+                while end < len(lines) and lines[end].mid - lines[end - 1].mid <= 20 and _is_header_continuation(lines[end], fuzzy):
+                    end += 1
+                if end > i + span:
+                    wider = _segment_header(lines[i:end], fuzzy)
+                    if header_ok({c.role for c in wider}):
+                        return i, end - 1, wider
                 return i, i + span - 1, columns
     return None
 
@@ -357,17 +388,39 @@ def infer_columns_from_data(lines: list[Line], page: int, ocr: bool) -> list[Col
 # ----------------------------------------------------------------------------------------------
 # Row extraction
 # ----------------------------------------------------------------------------------------------
+def _is_month_word(text: str) -> bool:
+    return text.strip(".,").lower()[:3] in _MONTH_PREFIXES and text.strip(".,").isalpha() and 3 <= len(text.strip(".,")) <= 9
+
+
+_MONTH_PREFIXES = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"}
+
+
 def _date_spans(words: list[Word]) -> list[tuple[int, int]]:
-    """Index ranges of words that form a date: one word ('01/04/24') or three ('01 Apr 2024')."""
+    """Index ranges of words that form a date: one word ('01/04/24'), three ('01 Apr 2024') or - for
+    a layout that prints the year on the next line under the day and month - two ('26 Aug')."""
     spans: list[tuple[int, int]] = []
     i = 0
     while i < len(words):
         if parse_date(words[i].text, strict=True):
             spans.append((i, i))
             i += 1
-        elif i + 2 < len(words) and parse_date(" ".join(w.text for w in words[i:i + 3]), strict=True):
-            spans.append((i, i + 2))
+            continue
+        three = None
+        if i + 2 < len(words) and parse_date(" ".join(w.text for w in words[i:i + 3]), strict=True):
+            # "26 Aug 26 Aug": the "26" after the month is the next column's day, not a 2-digit year
+            two_digit_year = re.fullmatch(r"\d{2}", words[i + 2].text) is not None
+            ambiguous = two_digit_year and (
+                (i + 3 < len(words) and _is_month_word(words[i + 3].text))
+                or words[i + 2].x0 - words[i + 1].x1 > 12  # a year sits right against its month
+            )
+            if not ambiguous:
+                three = (i, i + 2)
+        if three:
+            spans.append(three)
             i += 3
+        elif i + 1 < len(words) and re.fullmatch(r"\d{1,2}", words[i].text) and _is_month_word(words[i + 1].text):
+            spans.append((i, i + 1))
+            i += 2
         else:
             i += 1
     return spans
@@ -482,6 +535,94 @@ def _repair_ocr_dates(words: list[Word], previous: date | None) -> tuple[list[Wo
     return out, last
 
 
+_MONTH_NAMES = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+
+
+def _repair_month_tokens(words: list[Word]) -> list[Word]:
+    """The month of a "4 Oct 2024"-style date, damaged by OCR: "Oct!" (stray mark), "Oci" (a letter
+    misread) or "OctITO" (a following word glued on). Only a word right after a 1-2 digit day, inside
+    the date columns, is touched."""
+    import difflib
+
+    days = [d for d in words if d.x0 < 200 and re.fullmatch(r"\d{1,2}", d.text)]
+
+    def follows_a_day(w: Word) -> bool:
+        return any(
+            abs((d.top + d.bottom) / 2 - (w.top + w.bottom) / 2) <= 8 and 0 <= w.x0 - d.x1 <= 14 for d in days
+        )
+
+    out: list[Word] = []
+    for w in words:
+        if w.x0 >= 200 or not re.match(r"[A-Za-z]{3}", w.text) or not follows_a_day(w):
+            out.append(w)
+            continue
+        cleaned = w.text.rstrip(".,!|:;)(][\'")
+        if cleaned.lower() in _MONTH_NAMES:
+            out.append(Word(cleaned, w.x0, w.x1, w.top, w.bottom, w.line_start) if cleaned != w.text else w)
+            continue
+        letters = re.match(r"^[A-Za-z]+", w.text).group(0)
+        if len(letters) > 3 and letters[:3].lower() in _MONTH_NAMES:
+            # a following word glued on: "OctITO" -> "Oct" + "TO" (a ruling-line "I" in between)
+            rest = w.text[3:].lstrip("Il|!.,:;")
+            cut = w.x0 + (w.x1 - w.x0) * 3 / len(w.text)
+            out.append(Word(letters[:3].capitalize(), w.x0, cut, w.top, w.bottom, w.line_start))
+            if rest:
+                out.append(Word(rest, cut, w.x1, w.top, w.bottom))
+            continue
+        near = difflib.get_close_matches(letters.lower(), _MONTH_NAMES, n=1, cutoff=0.6) if len(letters) == 3 else []
+        out.append(Word(near[0].capitalize(), w.x0, w.x1, w.top, w.bottom, w.line_start) if near else w)
+    return out
+
+
+def _fill_missing_day(words: list[Word]) -> list[Word]:
+    """A row whose Post Date lost its day to OCR ("Oct 2024 | 5 Oct 2024"): in these statements the
+    Value Date repeats the Post Date, so borrow the day from it."""
+    out = list(words)
+    ordered = sorted(range(len(words)), key=lambda k: ((words[k].top + words[k].bottom) / 2, words[k].x0))
+    groups: list[list[int]] = []
+    for k in ordered:
+        mid = (words[k].top + words[k].bottom) / 2
+        if groups and abs(mid - (words[groups[-1][0]].top + words[groups[-1][0]].bottom) / 2) <= 5:
+            groups[-1].append(k)
+        else:
+            groups.append([k])
+    for g in groups:
+        g.sort(key=lambda k: words[k].x0)
+        months = [pos for pos, k in enumerate(g) if words[k].x0 < 200 and _is_month_word(words[k].text) and words[k].text.lower()[:3] in _MONTH_NAMES]
+        if len(months) < 2:
+            continue
+        def day_before(pos: int) -> Word | None:
+            if pos == 0:
+                return None
+            d = words[g[pos - 1]]
+            return d if re.fullmatch(r"\d{1,2}", d.text) and 0 <= words[g[pos]].x0 - d.x1 <= 14 else None
+        first, second = months[0], months[1]
+        if day_before(first) is None and (d2 := day_before(second)) is not None:
+            m = words[g[first]]
+            out.append(Word(d2.text, m.x0 - 9, m.x0 - 1, m.top, m.bottom))
+    return out
+
+
+_GLUED_DAY_MONTH = re.compile(r"^\W*(\d{1,2})[.\s]*([A-Za-z]{3,9})\.?\W*$")
+
+
+def _split_glued_day_month(words: list[Word]) -> list[Word]:
+    """"25Nov", "4.Nov", "-22Sep|": a day and month the OCR ran together (or wrapped in ruling-line
+    noise) - split them so the date is recognised."""
+    out: list[Word] = []
+    for w in words:
+        m = _GLUED_DAY_MONTH.match(w.text) if w.x0 < 200 else None
+        if m and _is_month_word(m.group(2)):
+            day, month = m.group(1), m.group(2)
+            total = len(day) + len(month)
+            cut = w.x0 + (w.x1 - w.x0) * len(day) / total
+            out.append(Word(day, w.x0, cut, w.top, w.bottom, w.line_start))
+            out.append(Word(month, cut, w.x1, w.top, w.bottom))
+        else:
+            out.append(w)
+    return out
+
+
 def _is_ocr_junk(token: str) -> bool:
     """Scraps OCR invents out of shadows and paper grain: a short run of letters that is neither
     upper-case (bank codes: WDL, TFR, AT) nor mixed with digits/punctuation (references, names of
@@ -578,7 +719,7 @@ def plan_ocr_columns(pages: list[list[Word]]) -> list[list[Column] | None]:
     prepared: list[list[Word]] = []
     state_date: date | None = None
     for words in pages:
-        fixed, state_date = _repair_ocr_dates(_fix_symbol_for_five(_merge_split_money(words)), state_date)
+        fixed, state_date = _repair_ocr_dates(_fill_missing_day(_split_glued_day_month(_repair_month_tokens(_fix_symbol_for_five(_merge_split_money(words))))), state_date)
         prepared.append(_dewarp(fixed))
     best: tuple[int, list[Column], tuple[float, float]] | None = None
     for words in prepared:
@@ -589,6 +730,8 @@ def plan_ocr_columns(pages: list[list[Word]]) -> list[list[Column] | None]:
         found = find_header(lines, fuzzy=True)
         cols = found[2] if found else None
         score = len({c.role for c in cols if c.role}) if cols else 0
+        if cols and "amount" in {c.role for c in cols} and {"debit", "credit"} & {c.role for c in cols}:
+            score -= 3  # a single Amount column beside Debit/Credit is a header misread ("Value" read as an amount)
         if not cols or not {"date", "narration", "balance"} <= {c.role for c in cols} or not {"debit", "credit"} & {c.role for c in cols}:
             inferred = infer_columns_from_data(lines, 0, True)
             if inferred and {"debit", "credit", "balance"} <= {c.role for c in inferred}:
@@ -714,7 +857,7 @@ def layout_page(
     columns_override: list[Column] | None = None,
 ) -> list[RawRow]:
     if ocr:
-        words = _fix_symbol_for_five(_merge_split_money(words))
+        words = _fill_missing_day(_split_glued_day_month(_repair_month_tokens(_fix_symbol_for_five(_merge_split_money(words)))))
         words, state.last_date = _repair_ocr_dates(words, state.last_date)
         words = _dewarp(words)
     lines = group_lines(words)
@@ -765,6 +908,47 @@ def find_date_free(line: Line) -> bool:
     return not _date_spans(line.words) and not any(is_money_like(w.text) for w in line.words)
 
 
+_NAMES_FOR_JOINING = _COMMON_NAMES | {"KRISHNA", "AAKASH", "PHONEPE", "RAJKUMAR", "MOHAMMAD", "MOHAMMED", "SHAMBHU"}
+
+
+def _detect_wrap_width(seg: list[Line], narr_col: Column, first_num_x0: float, text_cols: list[Column]) -> int:
+    """Width, in characters, at which a statement hard-wraps its narration column - or 0.
+
+    A wrapped column has a ceiling: many lines are exactly as long as it allows and none longer. A
+    free-flowing column has no such repeated maximum, so its lines do not pile up at one length."""
+    right = min([c.x0 for c in text_cols if c is not narr_col and c.x0 > narr_col.x0] + [first_num_x0]) - 4
+    lengths: list[int] = []
+    for line in seg:
+        ws = [w for w in line.words if w.x0 >= narr_col.x0 - 8 and w.x1 <= right + 4 and not parse_date(w.text, strict=True)]
+        if ws:
+            lengths.append(len(" ".join(w.text for w in ws)))
+    if len(lengths) < 12:
+        return 0
+    best = (0, 0)
+    for width in range(18, 61):
+        at = sum(1 for n in lengths if width - 1 <= n <= width + 1)  # OCR spacing moves a line by a character
+        over = sum(1 for n in lengths if n > width + 2)
+        if at >= 6 and at >= 0.12 * len(lengths) and over <= max(2, 0.05 * len(lengths)) and at > best[0]:
+            best = (at, width)
+    return best[1]
+
+
+def _continues_split_word(previous: str, next_text: str) -> bool:
+    """Did a hard wrap cut a word in two, rather than land between two words?
+
+    Only the first piece of a name is known to be cut exactly at the width, but a name that merely
+    ends at the width looks identical. A single stray letter starting the next line ("RAKES" / "H K")
+    or two pieces that spell a known name ("KRISH" / "NA") are the cases worth joining; anything
+    else stays two words."""
+    lead = re.match(r"[A-Za-z]+", next_text)
+    tail = re.search(r"[A-Za-z]+$", previous.split("/")[-1].split(" ")[-1])
+    if not lead or not tail or previous.rstrip().endswith("-"):
+        return False
+    if len(lead.group(0)) == 1:
+        return True
+    return len(lead.group(0)) <= 3 and (tail.group(0) + lead.group(0)).upper() in _NAMES_FOR_JOINING
+
+
 def _rows_from_columns(
     lines: list[Line], columns: list[Column], page: int, ocr: bool, start: int, state: LayoutState,
 ) -> list[RawRow]:
@@ -808,6 +992,26 @@ def _rows_from_columns(
             return False  # (a bare 10+ digit run is a reference/account number, never an amount)
         return "." in w.text or "," in w.text or w.x0 >= first_num_x0 - 3
 
+    cur_date_x0: float | None = None
+    cur_value_x0: float | None = None
+
+    def route(w: Word, target: list[str]) -> Column | None:
+        """Column for a continuation-line word. A bare year under the date columns is the missing
+        year of the row above ("26 Aug" printed over "2024"); everything else goes by text column."""
+        if date_col is not None and cur_date_x0 is not None and re.fullmatch(r"\W*2[0-9ONon]{3}\W*", w.text):
+            dx = abs(w.x0 - cur_date_x0)
+            vx = abs(w.x0 - cur_value_x0) if cur_value_x0 is not None else 1e9
+            if min(dx, vx) <= 30:
+                # A year under the date columns; one the OCR garbled ("2N24", "2074)") is dropped
+                # rather than left in the narration - the date is completed from its neighbours.
+                if not re.fullmatch(r"(?:19|20)\d{2}", w.text.strip(" ).,;:|'")):
+                    return None
+                w.text = w.text.strip(" ).,;:|'")
+                col = date_col if dx <= vx else value_date_col
+                k = index_of.get(id(col)) if col is not None else None
+                return None if k is None or re.search(r"\d{4}", target[k]) else col
+        return _text_column(w, text_cols, narr_col, has_serial)
+
     def blank() -> list[str]:
         return [""] * len(out_cols)
 
@@ -816,6 +1020,16 @@ def _rows_from_columns(
             return
         k = index_of[id(col)]
         if ocr and col is narr_col and _is_ocr_junk(text):
+            return
+        if state.wrap_width and not state.hard_wrap and col is narr_col and cells[k]:
+            key = (id(cells), k)
+            used_len = state.chunk_len.get(key, len(cells[k]))
+            if brk and (cells[k].endswith("/") or (used_len >= state.wrap_width - 2 and _continues_split_word(cells[k], text))):
+                cells[k] += text  # (a line ending in "/" runs on into the next field: "IKRAM/" + "BARB")
+                state.chunk_len[key] = len(text)
+            else:
+                cells[k] += " " + text
+                state.chunk_len[key] = len(text) if brk else used_len + 1 + len(text)
             return
         if state.hard_wrap and col is narr_col and cells[k]:
             key = (id(cells), k)
@@ -829,7 +1043,7 @@ def _rows_from_columns(
                 state.chunk_len[key] = used_len + 1 + len(text)
             return
         cells[k] = f"{cells[k]} {text}".strip()
-        if state.hard_wrap and col is narr_col:
+        if (state.hard_wrap or state.wrap_width) and col is narr_col:
             state.chunk_len[(id(cells), k)] = len(text)
 
     def find_head_date(ws: list[Word]) -> tuple[int, int] | None:
@@ -892,6 +1106,8 @@ def _rows_from_columns(
             return prefix_mode()
         if not current_self_narrated:
             return False  # the open row is still short of narration; the run is its continuation
+        if state.continuation_votes >= 4 and state.prefix_votes * 4 < state.continuation_votes:
+            return False  # this statement has settled into "wrapped lines follow their row"
         gap_before = run[0].mid - current_mid
         gap_after = nxt.mid - run[-1].mid
         if gap_after < 0.75 * gap_before:
@@ -910,6 +1126,8 @@ def _rows_from_columns(
         open row, or None when there is no such clear boundary."""
         if current is None or len(run) < 2 or not has_own_narration(nxt.words):
             return None
+        if state.continuation_votes > state.prefix_votes + 1:
+            return None  # this statement's wrapped lines have been following their row: believe that
         gaps = [run[0].mid - current_mid] + [b.mid - a.mid for a, b in zip(run, run[1:])] + [nxt.mid - run[-1].mid]
         widest = max(range(len(gaps)), key=lambda g: gaps[g])
         if widest in (0, len(gaps) - 1):
@@ -919,6 +1137,8 @@ def _rows_from_columns(
         return widest if typical > 0 and gaps[widest] >= 1.4 * typical else None
 
     seg = lines[start:]
+    if not state.wrap_width and not state.hard_wrap and narr_col is not None:
+        state.wrap_width = _detect_wrap_width(seg, narr_col, first_num_x0, text_cols)
     i = 0
     while i < len(seg):
         line = seg[i]
@@ -1014,7 +1234,7 @@ def _rows_from_columns(
                 if target is not None:
                     for rline in spill:
                         for w in rline.words:
-                            put(target, _text_column(w, text_cols, narr_col, has_serial), w.text, w.line_start)
+                            put(target, route(w, target) if target is current else _text_column(w, text_cols, narr_col, has_serial), w.text, w.line_start)
                         if target is current:
                             current_mid = rline.mid
                 i = run_end
@@ -1023,7 +1243,7 @@ def _rows_from_columns(
                 i += 1
                 continue
             for w in ws:
-                col = _text_column(w, text_cols, narr_col, has_serial)
+                col = route(w, current)
                 put(current, col, w.text, w.line_start)
             current_mid = line.mid
             i += 1
@@ -1080,6 +1300,8 @@ def _rows_from_columns(
             continue
         rows.append(RawRow(cells, page))
         current = state.last_row = cells
+        cur_date_x0 = ws[head_date[0]].x0 if head_date else None
+        cur_value_x0 = next((ws[sp[0]].x0 for sp in spans if head_date and sp != head_date and ws[sp[0]].x0 < first_num_x0), None)
         current_mid = line.mid
         current_self_narrated = head_date is not None and has_own_narration(ws)
         current_has_numbers = any(cells[index_of[id(c)]] for c in numeric_cols if id(c) in index_of)

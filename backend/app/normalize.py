@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from decimal import Decimal
 
 from .headers import classify_header, header_ok
@@ -75,6 +76,22 @@ def _repair_chunk_boundaries(text: str) -> str:
     for pattern, repl in _CHUNK_BOUNDARY_REPAIRS:
         text = pattern.sub(repl, text)
     return text
+
+
+_YEARLESS = re.compile(r"^\s*(\d{1,2})[\s/.\-]*([A-Za-z]{3,9})\.?\s*$")
+
+
+def _complete_yearless(text: str, previous: date | None) -> date | None:
+    """"22 Sep" with the year lost (printed on a line the OCR could not place): take it from the
+    previous row - the same year, or the next one if that would run the statement backwards."""
+    m = _YEARLESS.match(text or "")
+    if not m or previous is None:
+        return None
+    for year in (previous.year, previous.year + 1):
+        candidate = parse_date(f"{m.group(1)} {m.group(2)} {year}", strict=True)
+        if candidate and 0 <= (candidate - previous).days <= 200:
+            return candidate
+    return None
 
 
 def _nonzero(m: Money | None) -> Money | None:
@@ -155,6 +172,16 @@ def build_transactions(rows: list[RawRow], source: str) -> NormalizeResult:
         narration = _repair_chunk_boundaries(_KNOWN_FOOTER_SUFFIX.sub("", _cell(cells, mapping, "narration")).strip())
         d_raw = _cell_raw(cells, mapping, "date")
         date = parse_date(d_raw)
+        previous = txns[-1].date if txns else None
+        if date is None or (previous is not None and abs((date - previous).days) > 200):
+            # The Post Date was unreadable, lost its year, or has a misread one ("15 Oct 2074"):
+            # fall back to the Value Date beside it (the same day in these statements), then to the
+            # previous row's year - taking the first candidate that sits near the previous row.
+            vd_raw = _cell_raw(cells, mapping, "value_date")
+            candidates = [date, parse_date(vd_raw), _complete_yearless(str(d_raw), previous), _complete_yearless(str(vd_raw), previous)]
+            candidates = [c for c in candidates if c is not None]
+            near = [c for c in candidates if previous is None or abs((c - previous).days) <= 200]
+            date = (near or candidates or [None])[0]
         debit = _nonzero(parse_money(_strip_padded_reference_prefix(_cell_raw(cells, mapping, "debit"))))
         credit = _nonzero(parse_money(_strip_padded_reference_prefix(_cell_raw(cells, mapping, "credit"))))
         amount_m = _nonzero(parse_money(_strip_padded_reference_prefix(_cell_raw(cells, mapping, "amount"))))

@@ -39,11 +39,53 @@ def _name_field(narration: str) -> re.Match[str] | None:
     return _NAME_FIELD.match(narration)
 
 
+_TRANSFER_LEAD = re.compile(r"^[\W\d]{0,20}?\s*((?:TO|BY)\s*TRANSFER)\s*[-:.]*\s*(.*)$", re.I | re.S)
+_UPI_BODY = re.compile(r"[^\w/]*\bUPI/(?P<kind>[A-Za-z0-9]{1,3})/?\s*(?P<rrn>[0-9A-Za-z][0-9A-Za-z ]{9,15}?)(?=/|[A-Za-z]{3,}|-|$)")
+_RRN_LOOKALIKES = str.maketrans({"S": "5", "s": "5", "O": "0", "o": "0", "I": "1", "l": "1", "B": "8", "Z": "2"})
+
+
+def _tidy_upi_body(text: str) -> str:
+    """"UPI/DR/<12-digit RRN>/<name>/<bank>/<handle>/<remark>" read through OCR: a ruling-line mark
+    or quote in front of "UPI", a mangled DR/CR tag, a space or look-alike letter inside the
+    12-digit reference ("04802551707 7", "4241989990S7"), the reference glued to the name
+    ("...747VIJAYP AL"), and stray underscores inside a name."""
+    m = _UPI_BODY.search(text)
+    if not m:
+        return text
+    kind = m.group("kind").upper()
+    kind = {"IDR": "DR", "OR": "DR", "0R": "DR", "D": "DR"}.get(kind, kind)
+    rrn = m.group("rrn").replace(" ", "")
+    fixed = rrn.translate(_RRN_LOOKALIKES) if len(rrn) == 12 else rrn
+    if len(fixed) == 12 and fixed.isdigit():
+        rrn = fixed
+    elif len(rrn) > 12 and rrn[:12].translate(_RRN_LOOKALIKES).isdigit():
+        rrn = rrn[:12].translate(_RRN_LOOKALIKES) + "/" + rrn[12:]
+    head = text[:m.start()]
+    tail = re.sub(r"\s?_(?=[A-Za-z])", " ", text[m.end():])
+    if tail[:1].isalpha():  # the reference ran straight into the name
+        tail = "/" + tail
+    return f"{head}UPI/{kind}/{rrn}{tail}".strip()
+
+
+def _tidy_transfer_narration(text: str) -> str:
+    """"TO TRANSFER-" / "BY TRANSFER-" narrations (SBI): fragments of the date columns and of the
+    reference column ("27", "2024)", "TRANSFER") that rode along on the same lines are not part of
+    the narration."""
+    m = _TRANSFER_LEAD.match(text)
+    if not m:
+        return text
+    rest = m.group(2)
+    rest = re.sub(r"^(?:(?:19|20)\d{2}\W*\s*)+", "", rest)
+    rest = re.sub(r"^(?:TRANSFER\W*\s*)+(?=\W*UPI|INB|NEFT|IMPS)", "", rest, flags=re.I)
+    rest = re.sub(r"^\W*\d{1,4}\s+(?=\W*UPI)", "", rest)  # a date fragment left in front of UPI/...
+    return f"{m.group(1).upper()}- {_tidy_upi_body(rest)}".strip()
+
+
 def clean_ocr_narrations(txns: list[Transaction]) -> None:
     """Tidy ``narration`` in place for every transaction (call only for OCR-read statements)."""
     for t in txns:
         text = _STRAY_QUOTE.sub("", t.narration)
-        t.narration = _LEADING_JUNK.sub("", text)
+        t.narration = _tidy_transfer_narration(_LEADING_JUNK.sub("", text))
 
     vocabulary: Counter[str] = Counter()
     clean_names: set[str] = set()
