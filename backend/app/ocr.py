@@ -39,7 +39,7 @@ def _require_tesseract():
             "OCR_UNAVAILABLE",
             "This PDF looks like a scan (no text layer) but OCR is not available on the server. "
             "Install the Tesseract OCR engine (e.g. `apt install tesseract-ocr` or "
-            "`brew install tesseract`), or upload the CSV/XLSX statement instead.",
+            "`brew install tesseract`), or upload a text-based (not scanned) statement instead.",
             status=503,
         ) from exc
 

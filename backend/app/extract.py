@@ -31,4 +31,4 @@ def extract_statement(data: bytes, filename: str, password: str | None = None, o
         return read_excel(data, filename)
     if kind == "csv":
         return read_csv(data)
-    raise StatementError("UNSUPPORTED_FILE", "Please upload a PDF, CSV, XLSX or XLS bank statement.")
+    raise StatementError("UNSUPPORTED_FILE", "Please upload a PDF bank statement.")

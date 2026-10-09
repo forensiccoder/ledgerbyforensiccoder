@@ -133,7 +133,7 @@ def analyze(data: bytes, filename: str, password: str | None = None, ocr_mode: s
     if not txns:
         hint = ""
         if extracted.method == "ocr" or extracted.ocr_pages:
-            hint = " The pages were read with OCR; try a higher-quality scan or the bank's CSV/XLSX export."
+            hint = " The pages were read with OCR; try a higher-quality scan or a text-based statement from the bank."
         raise StatementError(
             "NO_TRANSACTIONS",
             "No transaction rows were found. Check that this is a bank statement with a header row "
