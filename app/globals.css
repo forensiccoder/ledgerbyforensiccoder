@@ -77,3 +77,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .export-menu button:hover { background: var(--amber); }
 .export-menu button + button { border-top: 1px solid var(--line); }
 @media (max-width: 760px) { .export-menu { left: 0; right: auto; } }
+.sort-button { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; white-space: nowrap; }
+.sort-button:hover { color: var(--ink); text-decoration: underline; }
+.sort-button span { margin-left: 4px; font-size: 12px; }
